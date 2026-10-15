@@ -1,0 +1,11 @@
+{
+  "idf.projectPath": "${workspaceFolder}/esp32_cloud",
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=d:\\Workspace\\Projects\\Wearable Device\\gateway\\esp32_cloud\\build"
+  ],
+  "idf.currentSetup": "C:\\esp\\v6.0.2\\esp-idf",
+  "cmake.sourceDirectory": "D:/Workspace/Projects/Wearable_Device/gateway/esp32_cloud"
+}

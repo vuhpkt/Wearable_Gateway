@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.20.0)
+
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(gateway_nrf_central)
+
+target_sources(app PRIVATE 
+    src/main.c
+    src/ble_central_mgr.c
+    src/ble_node_slots.c
+    src/uart_tx_bridge.c
+    src/uart_tx_queue.c
+)
+
+target_include_directories(app PRIVATE
+    src
+    ../common
+)

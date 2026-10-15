@@ -1,0 +1,27 @@
+# Target SoC
+CONFIG_IDF_TARGET="esp32s3"
+
+# CPU Frequency (240MHz for high throughput telemetry & crypto)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Flash Size (16MB for N16 module)
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# External PSRAM / SPIRAM (8MB Octal OPI PSRAM for R8 module)
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# FreeRTOS Configuration (1000Hz = 1ms tick rate)
+CONFIG_FREERTOS_HZ=1000
+
+# Logging Output
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_COLORS=y
+
+# Partition Table: Single factory app, large (nearly 2MB)
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+

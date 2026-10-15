@@ -1,0 +1,18 @@
+{
+    "configurations": [
+        {
+            "name": "ESP32-S3 (ESP-IDF v6.0.2)",
+            "compilerPath": "C:/Espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc.exe",
+            "compileCommands": "${workspaceFolder}/build/compile_commands.json",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/../../common/**",
+                "C:/esp/v6.0.2/esp-idf/components/**"
+            ],
+            "cStandard": "gnu23",
+            "cppStandard": "gnu++23",
+            "intelliSenseMode": "gcc-x64"
+        }
+    ],
+    "version": 4
+}

@@ -1,0 +1,47 @@
+{
+    "configurations": [
+        {
+            "name": "nRF52840 (NCS Zephyr RTOS)",
+            "includePath": [
+                "${workspaceFolder}/nrf_central/src/**",
+                "${workspaceFolder}/common/**",
+                "C:/ncs/v3.4.0/zephyr/include/**",
+                "C:/ncs/v3.4.0/nrf/include/**",
+                "C:/ncs/v3.4.0/zephyr/soc/nordic/**",
+                "C:/ncs/v3.4.0/modules/hal/nordic/nrfx/**",
+                "C:/ncs/v3.4.0/modules/hal/cmsis_6/CMSIS/Core/Include/**",
+                "${workspaceFolder}/nrf_central/build/nrf_central/zephyr/include/generated/**"
+            ],
+            "defines": [
+                "__ZEPHYR__=1",
+                "NRF52840_XXAA",
+                "KERNEL",
+                "CONFIG_ARM=1"
+            ],
+            "compilerPath": "C:/ncs/toolchains/dcbdc366a1/opt/zephyr-sdk/gnu/arm-zephyr-eabi/bin/arm-zephyr-eabi-gcc.exe",
+            "compileCommands": "${workspaceFolder}/nrf_central/build/nrf_central/compile_commands.json",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "gcc-arm"
+        },
+        {
+            "name": "ESP32-S3 (ESP-IDF v6.0.2)",
+            "compilerPath": "C:/Espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc.exe",
+            "compileCommands": "${workspaceFolder}/esp32_cloud/build/compile_commands.json",
+            "includePath": [
+                "${workspaceFolder}/esp32_cloud/main/**",
+                "${workspaceFolder}/esp32_cloud/build/config/**",
+                "${workspaceFolder}/common/**",
+                "C:/esp/v6.0.2/esp-idf/components/**"
+            ],
+            "defines": [
+                "ESP_PLATFORM",
+                "IDF_VER=\"v6.0.2\""
+            ],
+            "cStandard": "gnu23",
+            "cppStandard": "gnu++23",
+            "intelliSenseMode": "gcc-x64"
+        }
+    ],
+    "version": 4
+}

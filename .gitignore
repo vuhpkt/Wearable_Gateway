@@ -1,0 +1,15 @@
+# Zephyr & West build directories
+build/
+*.uf2
+*.hex
+*.bin
+*.elf
+*.map
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# ESP-IDF generated config
+sdkconfig
+sdkconfig.old
