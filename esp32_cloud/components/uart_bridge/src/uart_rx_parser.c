@@ -57,8 +57,11 @@ static void parse_byte(uint8_t byte) {
         case PARSER_STATE_READ_LEN:
             if (byte > 0 && byte <= UART_MAX_PAYLOAD_LEN) {
                 bool valid_len = true;
-                if (s_current_frame.pkt_type == UART_PKT_TYPE_ECG_BATCH && byte != 100) {
-                    valid_len = false;
+                if (s_current_frame.pkt_type == UART_PKT_TYPE_ECG_BATCH) {
+                    /* ECG batch payload must be an even byte length (multiple of sizeof(int16_t), 1..64 samples) */
+                    if ((byte % sizeof(int16_t) != 0) || (byte < sizeof(int16_t))) {
+                        valid_len = false;
+                    }
                 } else if (s_current_frame.pkt_type == UART_PKT_TYPE_VITALS && byte != 5) {
                     valid_len = false;
                 } else if (s_current_frame.pkt_type == UART_PKT_TYPE_NODE_STATUS && byte != 1) {

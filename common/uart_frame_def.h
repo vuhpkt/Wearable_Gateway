@@ -27,7 +27,7 @@ extern "C" {
  *  Packet Types
  * ════════════════════════════════════════════════════════════ */
 typedef enum {
-    UART_PKT_TYPE_ECG_BATCH   = 0x01, /* ECG waveform batch (100 bytes = 50 int16 samples) */
+    UART_PKT_TYPE_ECG_BATCH   = 0x01, /* ECG waveform batch (even length 2..128 bytes, 1..64 int16 samples) */
     UART_PKT_TYPE_VITALS      = 0x02, /* Vitals (5 bytes: hr_ecg, hr_ppg, spo2, temp_x10) */
     UART_PKT_TYPE_NODE_STATUS = 0x03, /* Connection state report (1 byte: 0=DISC, 1=CONN) */
     UART_PKT_TYPE_DOWNLINK    = 0x80, /* Downlink command forwarded to node (CMD_*) */
