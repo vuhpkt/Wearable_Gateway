@@ -7,28 +7,37 @@
 #include "tb_rest_client.h"
 #include "thingsboard_config.h"
 #include "uart_frame_def.h"
-#include "wifi_sta_mgr.h"
 
+#ifdef HOST_TEST
+#include "gateway_host_port.h"
+#else
+#include "wifi_sta_mgr.h"
 #include <esp_crt_bundle.h>
 #include <esp_http_client.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
+#endif
+
 #include <string.h>
 #include <time.h>
 
-static const char *TAG = "tb_rest";
+static const char *TAG __attribute__((unused)) = "tb_rest";
 
 typedef struct {
+    bool seen;
     bool desired_connected;
-    bool dirty;
+    bool rest_dirty;
+    bool mqtt_dirty;
     uint32_t generation;
 } node_desired_state_t;
 
 static node_desired_state_t s_desired_states[MAX_NODES_SUPPORTED] = {{0}};
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_rest_task_handle = NULL;
+
+#ifndef HOST_TEST
 static char s_jwt_token[1024] = {0};
 static time_t s_token_expiry = 0;
 
@@ -38,6 +47,7 @@ static char s_node_uuid_cache[MAX_NODES_SUPPORTED][37] = {{0}};
 /* Static buffers để giảm tải stack của tb_rest_task */
 static char s_resp_buf[2048] = {0};
 static char s_auth_header[1100] = {0};
+#endif
 
 void *tb_rest_get_task_handle(void) {
     return (void *)s_rest_task_handle;
@@ -48,14 +58,95 @@ void tb_rest_set_node_connected(uint8_t node_id, bool connected) {
         return;
     }
     portENTER_CRITICAL(&s_state_lock);
+    s_desired_states[node_id].seen = true;
     s_desired_states[node_id].desired_connected = connected;
-    s_desired_states[node_id].dirty = true;
+    s_desired_states[node_id].rest_dirty = true;
+    s_desired_states[node_id].mqtt_dirty = true;
     s_desired_states[node_id].generation++;
     portEXIT_CRITICAL(&s_state_lock);
 
     if (s_rest_task_handle != NULL) {
         xTaskNotifyGive(s_rest_task_handle);
     }
+}
+
+void tb_rest_infer_node_connected_if_unseen(uint8_t node_id) {
+    if (node_id >= MAX_NODES_SUPPORTED) {
+        return;
+    }
+    bool notify = false;
+    portENTER_CRITICAL(&s_state_lock);
+    if (!s_desired_states[node_id].seen) {
+        s_desired_states[node_id].seen = true;
+        s_desired_states[node_id].desired_connected = true;
+        s_desired_states[node_id].rest_dirty = true;
+        s_desired_states[node_id].mqtt_dirty = true;
+        s_desired_states[node_id].generation++;
+        notify = true;
+    }
+    portEXIT_CRITICAL(&s_state_lock);
+
+    if (notify && s_rest_task_handle != NULL) {
+        xTaskNotifyGive(s_rest_task_handle);
+    }
+}
+
+bool tb_rest_get_node_snapshot(uint8_t node_id, tb_node_state_snapshot_t *out_snapshot) {
+    if (node_id >= MAX_NODES_SUPPORTED || out_snapshot == NULL) {
+        return false;
+    }
+    portENTER_CRITICAL(&s_state_lock);
+    bool is_seen = s_desired_states[node_id].seen;
+    if (is_seen) {
+        out_snapshot->seen = true;
+        out_snapshot->desired_connected = s_desired_states[node_id].desired_connected;
+        out_snapshot->generation = s_desired_states[node_id].generation;
+    }
+    portEXIT_CRITICAL(&s_state_lock);
+    return is_seen;
+}
+
+bool tb_rest_get_mqtt_pending_sync(uint8_t node_id, tb_node_state_snapshot_t *out_snapshot) {
+    if (node_id >= MAX_NODES_SUPPORTED || out_snapshot == NULL) {
+        return false;
+    }
+    portENTER_CRITICAL(&s_state_lock);
+    bool pending = s_desired_states[node_id].seen && s_desired_states[node_id].mqtt_dirty;
+    if (pending) {
+        out_snapshot->seen = true;
+        out_snapshot->desired_connected = s_desired_states[node_id].desired_connected;
+        out_snapshot->generation = s_desired_states[node_id].generation;
+    }
+    portEXIT_CRITICAL(&s_state_lock);
+    return pending;
+}
+
+void tb_rest_ack_mqtt_synced(uint8_t node_id, uint32_t generation) {
+    if (node_id >= MAX_NODES_SUPPORTED) {
+        return;
+    }
+    portENTER_CRITICAL(&s_state_lock);
+    if (s_desired_states[node_id].generation == generation) {
+        s_desired_states[node_id].mqtt_dirty = false;
+    }
+    portEXIT_CRITICAL(&s_state_lock);
+}
+
+void tb_rest_mark_all_mqtt_dirty(void) {
+    portENTER_CRITICAL(&s_state_lock);
+    for (uint8_t i = 0; i < MAX_NODES_SUPPORTED; i++) {
+        if (s_desired_states[i].seen) {
+            s_desired_states[i].mqtt_dirty = true;
+        }
+    }
+    portEXIT_CRITICAL(&s_state_lock);
+}
+
+void tb_rest_reset_state_for_test(void) {
+    portENTER_CRITICAL(&s_state_lock);
+    memset(s_desired_states, 0, sizeof(s_desired_states));
+    portEXIT_CRITICAL(&s_state_lock);
+    s_rest_task_handle = NULL;
 }
 
 bool tb_rest_parse_device_uuid(const char *json_str, char *out_uuid, size_t out_uuid_len) {
@@ -107,6 +198,7 @@ bool tb_rest_parse_device_uuid(const char *json_str, char *out_uuid, size_t out_
     return true;
 }
 
+#ifndef HOST_TEST
 typedef struct {
     char *buf;
     size_t max_len;
@@ -349,7 +441,7 @@ static void tb_rest_task(void *pvParameters) {
             uint32_t gen = 0;
 
             portENTER_CRITICAL(&s_state_lock);
-            if (s_desired_states[i].dirty) {
+            if (s_desired_states[i].rest_dirty) {
                 need_sync = true;
                 target_state = s_desired_states[i].desired_connected;
                 gen = s_desired_states[i].generation;
@@ -386,9 +478,9 @@ static void tb_rest_task(void *pvParameters) {
             esp_err_t set_err = tb_rest_set_attribute(s_node_uuid_cache[i], target_state, &http_status);
             if (set_err == ESP_OK) {
                 portENTER_CRITICAL(&s_state_lock);
-                /* Only clear dirty flag if no newer state was posted while HTTP was in flight */
+                /* Only clear rest_dirty flag if no newer state was posted while HTTP was in flight */
                 if (s_desired_states[i].generation == gen) {
-                    s_desired_states[i].dirty = false;
+                    s_desired_states[i].rest_dirty = false;
                 }
                 portEXIT_CRITICAL(&s_state_lock);
             } else {
@@ -402,8 +494,18 @@ static void tb_rest_task(void *pvParameters) {
         }
     }
 }
+#else
+static void tb_rest_task(void *pvParameters) {
+    (void)pvParameters;
+}
+#endif
 
 esp_err_t tb_rest_client_init(void) {
+    if (s_rest_task_handle != NULL) {
+        ESP_LOGI(TAG, "TB REST Client already initialized (idempotent)");
+        return ESP_OK;
+    }
+
     BaseType_t ret = xTaskCreatePinnedToCore(
         tb_rest_task,
         "tb_rest_task",
