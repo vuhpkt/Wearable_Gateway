@@ -15,11 +15,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "wifi_ap.h"
 #include "wifi_portal.h"
 
 static const char *TAG = "WIFI_PORTAL";
 static httpd_handle_t s_server = NULL;
 static wifi_portal_new_creds_cb_t s_creds_cb = NULL;
+static volatile bool s_transition_in_progress = false;
 
 static const char PORTAL_HTML[] =
 "<!DOCTYPE html>"
@@ -70,6 +72,32 @@ static void url_decode(char *dst, size_t dst_size, const char *src) {
     dst[i] = '\0';
 }
 
+/* [M2 FIX] Strict query parameter extractor matching exact key names */
+static bool get_query_param(const char *body, const char *key, char *out_val, size_t out_val_size) {
+    if (!body || !key || !out_val || out_val_size == 0) return false;
+
+    size_t key_len = strlen(key);
+    const char *p = body;
+
+    while (*p) {
+        bool key_start = (p == body) || (*(p - 1) == '&');
+        if (key_start && strncmp(p, key, key_len) == 0 && p[key_len] == '=') {
+            const char *val_start = p + key_len + 1;
+            const char *val_end = strchr(val_start, '&');
+            size_t val_len = val_end ? (size_t)(val_end - val_start) : strlen(val_start);
+
+            if (val_len >= out_val_size) {
+                val_len = out_val_size - 1;
+            }
+            memcpy(out_val, val_start, val_len);
+            out_val[val_len] = '\0';
+            return true;
+        }
+        p++;
+    }
+    return false;
+}
+
 typedef struct {
     char ssid[33];
     char pass[65];
@@ -83,6 +111,9 @@ static void async_transition_task(void *pvParameters) {
         s_creds_cb(params->ssid, params->pass);
     }
 
+    /* [L3 FIX] Zero out sensitive credentials in memory before freeing (CWE-226) */
+    memset(params->pass, 0, sizeof(params->pass));
+    memset(params->ssid, 0, sizeof(params->ssid));
     free(params);
     vTaskDelete(NULL);
 }
@@ -94,57 +125,77 @@ static esp_err_t get_index_handler(httpd_req_t *req) {
 }
 
 static esp_err_t post_save_handler(httpd_req_t *req) {
-    char buf[256] = {0};
-    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
-    if (ret <= 0) {
-        httpd_resp_send_500(req);
+    /* [H4 FIX] Guard against duplicate clicks spawning competing transition tasks */
+    if (s_transition_in_progress) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Provisioning already in progress");
         return ESP_FAIL;
     }
+
+    /* [H3 FIX] Validate content length and handle fragmented TCP receive */
+    int total_len = req->content_len;
+    if (total_len <= 0 || total_len >= 512) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
+        return ESP_FAIL;
+    }
+
+    char buf[512] = {0};
+    int cur_offset = 0;
+    while (cur_offset < total_len) {
+        int received = httpd_req_recv(req, buf + cur_offset, total_len - cur_offset);
+        if (received <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        cur_offset += received;
+    }
+    buf[total_len] = '\0';
 
     char raw_ssid[128] = {0};
     char raw_pass[128] = {0};
     char ssid[33] = {0};
     char pass[65] = {0};
 
-    const char *p_ssid = strstr(buf, "ssid=");
-    const char *p_pass = strstr(buf, "pass=");
+    bool has_ssid = get_query_param(buf, "ssid", raw_ssid, sizeof(raw_ssid));
+    bool has_pass = get_query_param(buf, "pass", raw_pass, sizeof(raw_pass));
 
-    if (p_ssid && p_pass) {
-        p_ssid += 5;
-        const char *end_ssid = strchr(p_ssid, '&');
-        size_t len_ssid = end_ssid ? (size_t)(end_ssid - p_ssid) : strlen(p_ssid);
-        if (len_ssid >= sizeof(raw_ssid)) len_ssid = sizeof(raw_ssid) - 1;
-        strncpy(raw_ssid, p_ssid, len_ssid);
-        raw_ssid[len_ssid] = '\0';
-
-        p_pass += 5;
-        const char *end_pass = strchr(p_pass, '&');
-        size_t len_pass = end_pass ? (size_t)(end_pass - p_pass) : strlen(p_pass);
-        if (len_pass >= sizeof(raw_pass)) len_pass = sizeof(raw_pass) - 1;
-        strncpy(raw_pass, p_pass, len_pass);
-        raw_pass[len_pass] = '\0';
-
+    if (has_ssid && has_pass) {
         url_decode(ssid, sizeof(ssid), raw_ssid);
         url_decode(pass, sizeof(pass), raw_pass);
 
+        if (strlen(ssid) == 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID cannot be empty");
+            return ESP_FAIL;
+        }
+
         ESP_LOGI(TAG, "Received new credentials via Web Portal: SSID='%s'", ssid);
 
-        /* Send Success HTML Response */
-        char resp[512];
-        snprintf(resp, sizeof(resp),
-                 "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'><title>Saved</title>"
-                 "<style>body{font-family:sans-serif;text-align:center;padding:40px;background:#0f172a;color:#fff;}h2{color:#4ade80;}</style></head>"
-                 "<body><h2>Credentials Saved!</h2><p>Connecting to <b>%s</b>...</p><p>You may reconnect to your home Wi-Fi.</p></body></html>",
-                 ssid);
-        httpd_resp_set_type(req, "text/html; charset=utf-8");
-        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        /* [M9 FIX] Disarm SoftAP idle timeout immediately upon valid credential submission */
+        wifi_ap_cancel_timeout();
 
-        /* Launch async transition to allow TCP socket to close cleanly */
-        transition_params_t *params = malloc(sizeof(transition_params_t));
+        /* [H12 FIX] Fixed static HTML response prevents Reflected XSS (CWE-79) */
+        static const char SUCCESS_HTML[] =
+            "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'><title>Saved</title>"
+            "<style>body{font-family:sans-serif;text-align:center;padding:40px;background:#0f172a;color:#fff;}h2{color:#4ade80;}</style></head>"
+            "<body><h2>Credentials Saved!</h2><p>Connecting to Wi-Fi network...</p><p>You may reconnect to your home Wi-Fi.</p></body></html>";
+
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        httpd_resp_send(req, SUCCESS_HTML, HTTPD_RESP_USE_STRLEN);
+
+        /* [H1 FIX] Zeroed heap allocation with calloc ensuring null-termination (CWE-170) */
+        transition_params_t *params = calloc(1, sizeof(transition_params_t));
         if (params) {
             strncpy(params->ssid, ssid, sizeof(params->ssid) - 1);
             strncpy(params->pass, pass, sizeof(params->pass) - 1);
-            xTaskCreate(async_transition_task, "prov_trans_tsk", 3072, params, 3, NULL);
+            s_transition_in_progress = true;
+            BaseType_t task_ok = xTaskCreate(async_transition_task, "prov_trans_tsk", 3072, params, 3, NULL);
+            if (task_ok != pdPASS) {
+                ESP_LOGE(TAG, "Failed to create async_transition_task");
+                s_transition_in_progress = false;
+                free(params);
+            }
         }
 
         return ESP_OK;
@@ -159,6 +210,7 @@ esp_err_t wifi_portal_start(wifi_portal_new_creds_cb_t on_creds_received) {
         return ESP_OK; /* Already running */
     }
 
+    s_transition_in_progress = false;
     s_creds_cb = on_creds_received;
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -195,6 +247,7 @@ void wifi_portal_stop(void) {
     if (s_server != NULL) {
         httpd_stop(s_server);
         s_server = NULL;
+        s_transition_in_progress = false;
         ESP_LOGI(TAG, "Web Portal stopped.");
     }
 }
