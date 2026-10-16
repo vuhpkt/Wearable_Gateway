@@ -48,12 +48,23 @@ static const char *TAG = "esp32_gateway";
 static QueueHandle_t s_frame_queue = NULL;
 
 /* ══════════════════════════════════════════════════════════════
- *  UART Rx Frame Callback (Dispatched by FSM on CRC OK)
+ *  UART Rx Frame Callback & Performance Metrics
  * ════════════════════════════════════════════════════════════ */
 static char s_synth_tx_buf[2048];
 static bool s_node_announced[MAX_NODES_SUPPORTED] = {0};
 static TaskHandle_t s_cloud_task_handle = NULL;
 static TaskHandle_t s_sensor_task_handle = NULL;
+
+typedef struct {
+    uint32_t ecg_batches_recv;
+    uint32_t vitals_recv;
+    uint32_t status_recv;
+    uint32_t mqtt_published;
+    uint32_t mqtt_dropped;
+    uint32_t queue_overflow;
+} gateway_metrics_t;
+
+static gateway_metrics_t s_metrics = {0};
 
 static void on_mqtt_connected(void) {
     memset(s_node_announced, 0, sizeof(s_node_announced));
@@ -67,12 +78,16 @@ static void ensure_node_connected(uint8_t node_id) {
         char connect_buf[64];
         int len = synth_format_node_status(connect_buf, sizeof(connect_buf), node_id, true, &topic);
         if (len > 0 && topic != NULL) {
-            tb_mqtt_publish(topic, connect_buf, 1);
-            s_node_announced[node_id] = true;
-            ESP_LOGI(TAG, "📡 Auto-announced v1/gateway/connect activation for Node%u", node_id + 1);
-
-            /* Call REST API to update SERVER_SCOPE connected=true for Web Dashboard LIVE status */
-            tb_rest_set_node_connected(node_id, true);
+            int msg_id = tb_mqtt_publish(topic, connect_buf, 1);
+            if (msg_id >= 0) {
+                s_metrics.mqtt_published++;
+                s_node_announced[node_id] = true;
+                ESP_LOGI(TAG, "📡 Auto-announced v1/gateway/connect activation for Node%u", node_id + 1);
+                /* Call REST API to update SERVER_SCOPE connected=true for Web Dashboard LIVE status */
+                tb_rest_set_node_connected(node_id, true);
+            } else {
+                s_metrics.mqtt_dropped++;
+            }
         }
     }
 }
@@ -81,7 +96,7 @@ static void on_uart_frame_received(const uart_rx_frame_t *frame) {
     if (s_frame_queue != NULL) {
         BaseType_t ret = xQueueSend(s_frame_queue, frame, 0);
         if (ret != pdTRUE) {
-            ESP_LOGW(TAG, "Queue full! Frame from Node %u dropped", frame->node_id);
+            s_metrics.queue_overflow++;
         }
     }
 }
@@ -89,6 +104,7 @@ static void on_uart_frame_received(const uart_rx_frame_t *frame) {
 static void publish_frame(const uart_rx_frame_t *frame) {
     switch (frame->pkt_type) {
     case UART_PKT_TYPE_NODE_STATUS: {
+        s_metrics.status_recv++;
         uint8_t status = frame->payload[0];
         bool is_conn = (status == 1);
         ESP_LOGI(TAG, "🟢 [NODE %u STATUS] %s (CRC OK)", frame->node_id, is_conn ? "CONNECTED" : "DISCONNECTED");
@@ -96,25 +112,39 @@ static void publish_frame(const uart_rx_frame_t *frame) {
         const char *topic = NULL;
         int len = synth_format_node_status(s_synth_tx_buf, sizeof(s_synth_tx_buf), frame->node_id, is_conn, &topic);
         if (len > 0 && tb_mqtt_is_connected() && topic != NULL) {
-            tb_mqtt_publish(topic, s_synth_tx_buf, 1);
-            if (frame->node_id < MAX_NODES_SUPPORTED) {
-                s_node_announced[frame->node_id] = is_conn;
+            int msg_id = tb_mqtt_publish(topic, s_synth_tx_buf, 1);
+            if (msg_id >= 0) {
+                s_metrics.mqtt_published++;
+                if (frame->node_id < MAX_NODES_SUPPORTED) {
+                    s_node_announced[frame->node_id] = is_conn;
+                }
+            } else {
+                s_metrics.mqtt_dropped++;
             }
+            tb_rest_set_node_connected(frame->node_id, is_conn);
+        } else {
+            /* [H04 FIX] Even if MQTT is offline, record the status to REST desired_state */
             tb_rest_set_node_connected(frame->node_id, is_conn);
         }
         break;
     }
     case UART_PKT_TYPE_VITALS: {
+        s_metrics.vitals_recv++;
         if (frame->len >= sizeof(vitals_packet_t)) {
             ensure_node_connected(frame->node_id);
             const vitals_packet_t *v = (const vitals_packet_t *)frame->payload;
             float temp_c = (float)v->temp_x10 / 10.0f;
-            ESP_LOGI(TAG, "💓 [NODE %u VITALS] HR_ECG: %u bpm | HR_PPG: %u bpm | SpO2: %u%% | Temp: %.1f°C (CRC OK)",
+            ESP_LOGD(TAG, "💓 [NODE %u VITALS] HR_ECG: %u bpm | HR_PPG: %u bpm | SpO2: %u%% | Temp: %.1f°C (CRC OK)",
                      frame->node_id, v->hr_ecg, v->hr_ppg, v->spo2, temp_c);
 
             int len = synth_format_vitals(s_synth_tx_buf, sizeof(s_synth_tx_buf), frame->node_id, v);
             if (len > 0 && tb_mqtt_is_connected()) {
-                tb_mqtt_publish(TB_GATEWAY_TELEMETRY_TOPIC, s_synth_tx_buf, 0);
+                int msg_id = tb_mqtt_publish(TB_GATEWAY_TELEMETRY_TOPIC, s_synth_tx_buf, 0);
+                if (msg_id >= 0) {
+                    s_metrics.mqtt_published++;
+                } else {
+                    s_metrics.mqtt_dropped++;
+                }
             } else if (len == -2) {
                 ESP_LOGW(TAG, "⏳ [NODE %u VITALS] Waiting for SNTP real-time clock synchronization...", frame->node_id);
             }
@@ -122,22 +152,30 @@ static void publish_frame(const uart_rx_frame_t *frame) {
         break;
     }
     case UART_PKT_TYPE_ECG_BATCH: {
+        s_metrics.ecg_batches_recv++;
         ensure_node_connected(frame->node_id);
         uint16_t sample_count = frame->len / sizeof(int16_t);
         const int16_t *samples = (const int16_t *)frame->payload;
-        ESP_LOGI(TAG, "📈 [NODE %u ECG BATCH] Received %u samples (First: %d, Last: %d) (CRC OK)", frame->node_id,
-                 sample_count, samples[0], samples[sample_count - 1]);
+        if (sample_count > 0) {
+            ESP_LOGD(TAG, "📈 [NODE %u ECG BATCH] Received %u samples (First: %d, Last: %d) (CRC OK)", frame->node_id,
+                     sample_count, samples[0], samples[sample_count - 1]);
+        }
 
         int len = synth_format_ecg_batch(s_synth_tx_buf, sizeof(s_synth_tx_buf), frame->node_id, samples, sample_count);
         if (len > 0 && tb_mqtt_is_connected()) {
-            tb_mqtt_publish(TB_GATEWAY_TELEMETRY_TOPIC, s_synth_tx_buf, 0);
+            int msg_id = tb_mqtt_publish(TB_GATEWAY_TELEMETRY_TOPIC, s_synth_tx_buf, 0);
+            if (msg_id >= 0) {
+                s_metrics.mqtt_published++;
+            } else {
+                s_metrics.mqtt_dropped++;
+            }
         } else if (len == -2) {
             ESP_LOGW(TAG, "⏳ [NODE %u ECG] Waiting for SNTP real-time clock synchronization...", frame->node_id);
         }
         break;
     }
     default:
-        ESP_LOGI(TAG, "📦 [NODE %u PKT 0x%02X] Received %u bytes payload (CRC OK)", frame->node_id, frame->pkt_type,
+        ESP_LOGD(TAG, "📦 [NODE %u PKT 0x%02X] Received %u bytes payload (CRC OK)", frame->node_id, frame->pkt_type,
                  frame->len);
         break;
     }
@@ -260,11 +298,14 @@ static void cloud_consumer_task(void *pvParameters) {
         }
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
         if (now_ms - last_health_log_ms >= 10000) {
+            uint32_t elapsed_s = (now_ms - last_health_log_ms) / 1000;
             last_health_log_ms = now_ms;
             UBaseType_t c_hwm = s_cloud_task_handle ? uxTaskGetStackHighWaterMark(s_cloud_task_handle) : 0;
             UBaseType_t s_hwm = s_sensor_task_handle ? uxTaskGetStackHighWaterMark(s_sensor_task_handle) : 0;
             TaskHandle_t rest_h = (TaskHandle_t)tb_rest_get_task_handle();
             UBaseType_t r_hwm = rest_h ? uxTaskGetStackHighWaterMark(rest_h) : 0;
+            uint32_t q_waiting = s_frame_queue ? (uint32_t)uxQueueMessagesWaiting(s_frame_queue) : 0;
+
             ESP_LOGI(TAG, "🩺 [HEALTH] Heap: %luB (Min: %luB) | Stacks(HWM): C:%u S:%u R:%u | Wi-Fi: %s | MQTT: %s | SNTP: %s",
                      (unsigned long)esp_get_free_heap_size(),
                      (unsigned long)esp_get_minimum_free_heap_size(),
@@ -272,6 +313,15 @@ static void cloud_consumer_task(void *pvParameters) {
                      wifi_sta_is_connected() ? "ONLINE" : "OFFLINE",
                      tb_mqtt_is_connected() ? "CONNECTED" : "DISCONNECTED",
                      wifi_sta_is_time_synced() ? "SYNCED" : "WAITING");
+
+            ESP_LOGI(TAG, "📊 [THROUGHPUT 10s] Ingress: ECG=%lu Vit=%lu (Rate: %lu/s) | MQTT: Pub=%lu Drop=%lu | Q_Wait: %lu | Q_Overfl: %lu",
+                     (unsigned long)s_metrics.ecg_batches_recv,
+                     (unsigned long)s_metrics.vitals_recv,
+                     (unsigned long)(elapsed_s ? (s_metrics.ecg_batches_recv + s_metrics.vitals_recv) / elapsed_s : 0),
+                     (unsigned long)s_metrics.mqtt_published,
+                     (unsigned long)s_metrics.mqtt_dropped,
+                     (unsigned long)q_waiting,
+                     (unsigned long)s_metrics.queue_overflow);
         }
     }
 }
@@ -311,6 +361,14 @@ void app_main(void) {
     /* Level 1 Power Optimization: Arm 5-minute SoftAP idle timeout to prevent continuous RF heating */
     wifi_ap_set_timeout(300, on_softap_timeout);
 
+    /* [M01 FIX] Create 128-item queue (~2.56s buffer) and spawn UART ingestion early */
+    s_frame_queue = xQueueCreate(128, sizeof(uart_rx_frame_t));
+    if (s_frame_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create s_frame_queue!");
+    }
+    xTaskCreatePinnedToCore(sensor_producer_task, "sensor_task", 4096, NULL, 5, &s_sensor_task_handle, 1);
+    ESP_LOGI(TAG, "🚀 Sensor Producer Task spawned on Core 1 (Ingestion Active immediately)");
+
     if (strlen(ssid) > 0) {
         ESP_LOGI(TAG, "Starting Wi-Fi connection to '%s' (Channels 1..13 dynamic scan)...", ssid);
         wifi_sta_init_with_creds(ssid, pass);
@@ -325,10 +383,7 @@ void app_main(void) {
         }
     }
 
-    s_frame_queue = xQueueCreate(64, sizeof(uart_rx_frame_t));
-
     xTaskCreatePinnedToCore(cloud_consumer_task, "cloud_task", 4096, NULL, 5, &s_cloud_task_handle, 0);
-    xTaskCreatePinnedToCore(sensor_producer_task, "sensor_task", 4096, NULL, 5, &s_sensor_task_handle, 1);
 
     ESP_LOGI(TAG, "Dual-Core tasks spawned successfully!");
 }

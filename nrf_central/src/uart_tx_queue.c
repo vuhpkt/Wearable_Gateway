@@ -24,9 +24,18 @@ void uart_tx_queue_init(void) {
     memset(&s_stats, 0, sizeof(s_stats));
 }
 
+#define UART_TX_PRIORITY_RESERVE 4
+
 int uart_tx_queue_send(uint8_t node_id, uint8_t pkt_type, const void *payload, uint8_t len) {
     if (!payload || len == 0 || len > UART_MAX_PAYLOAD_LEN || node_id >= MAX_NODES_SUPPORTED) {
         return -EINVAL;
+    }
+
+    /* M10: Reserve headroom for high-priority status frames so ECG bursts do not drop disconnect events */
+    if (pkt_type == UART_PKT_TYPE_ECG_BATCH &&
+        k_msgq_num_used_get(&s_uart_tx_msgq) >= (UART_TX_QUEUE_DEPTH - UART_TX_PRIORITY_RESERVE)) {
+        s_stats.dropped_count++;
+        return -ENOMEM;
     }
 
     uart_tx_item_t item;
@@ -89,8 +98,13 @@ static void uart_tx_worker_entry(void *p1, void *p2, void *p3) {
     while (1) {
         int ret = k_msgq_get(&s_uart_tx_msgq, &item, K_FOREVER);
         if (ret == 0) {
-            uart_tx_bridge_send_frame(item.node_id, item.pkt_type, item.payload, item.len);
-            s_stats.sent_count++;
+            int tx_ret = uart_tx_bridge_send_frame(item.node_id, item.pkt_type, item.payload, item.len);
+            if (tx_ret == 0) {
+                s_stats.sent_count++;
+            } else {
+                s_stats.error_count++;
+                LOG_ERR("UART bridge send frame failed (err %d)", tx_ret);
+            }
         }
     }
 }

@@ -25,6 +25,7 @@ typedef struct {
     uint32_t queued_count;
     uint32_t sent_count;
     uint32_t dropped_count;
+    uint32_t error_count;
 } uart_tx_queue_stats_t;
 
 /**

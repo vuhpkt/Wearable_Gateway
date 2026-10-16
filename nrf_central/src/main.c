@@ -94,13 +94,14 @@ int main(void) {
         uart_tx_queue_stats_t q_stats;
         uint32_t q_pending = uart_tx_queue_get_stats(&q_stats);
 
-        LOG_INF("[HEARTBEAT #%03u] Nodes: %u/10 (Sub: %u) | Q: %u/32 (Sent: %u, Drop: %u) | Uptime: %lld ms",
+        LOG_INF("[HEARTBEAT #%03u] Nodes: %u/10 (Sub: %u) | Q: %u/32 (Sent: %u, Drop: %u, Err: %u) | Uptime: %lld ms",
                 heartbeat_cnt++,
                 ble_central_mgr_get_connected_count(),
                 ble_central_mgr_get_subscribed_count(),
                 q_pending,
                 q_stats.sent_count,
                 q_stats.dropped_count,
+                q_stats.error_count,
                 k_uptime_get());
 
         k_msleep(LED_BLINK_INTERVAL_MS);

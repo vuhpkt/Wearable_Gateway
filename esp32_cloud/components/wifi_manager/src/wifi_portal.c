@@ -140,13 +140,18 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
 
     char buf[512] = {0};
     int cur_offset = 0;
+    int timeout_retries = 0;
     while (cur_offset < total_len) {
         int received = httpd_req_recv(req, buf + cur_offset, total_len - cur_offset);
         if (received <= 0) {
             if (received == HTTPD_SOCK_ERR_TIMEOUT) {
-                continue;
+                timeout_retries++;
+                if (timeout_retries < 3) {
+                    continue;
+                }
             }
-            httpd_resp_send_500(req);
+            s_transition_in_progress = false;
+            httpd_resp_send_408(req);
             return ESP_FAIL;
         }
         cur_offset += received;

@@ -56,10 +56,25 @@ static void parse_byte(uint8_t byte) {
 
         case PARSER_STATE_READ_LEN:
             if (byte > 0 && byte <= UART_MAX_PAYLOAD_LEN) {
-                s_current_frame.len = byte;
-                s_crc_buffer[2] = byte;
-                s_payload_idx = 0;
-                s_state = PARSER_STATE_READ_PAYLOAD;
+                bool valid_len = true;
+                if (s_current_frame.pkt_type == UART_PKT_TYPE_ECG_BATCH && byte != 100) {
+                    valid_len = false;
+                } else if (s_current_frame.pkt_type == UART_PKT_TYPE_VITALS && byte != 5) {
+                    valid_len = false;
+                } else if (s_current_frame.pkt_type == UART_PKT_TYPE_NODE_STATUS && byte != 1) {
+                    valid_len = false;
+                }
+
+                if (valid_len) {
+                    s_current_frame.len = byte;
+                    s_crc_buffer[2] = byte;
+                    s_payload_idx = 0;
+                    s_state = PARSER_STATE_READ_PAYLOAD;
+                } else if (byte == UART_FRAME_SOF) {
+                    s_state = PARSER_STATE_READ_NODE_ID;
+                } else {
+                    s_state = PARSER_STATE_WAIT_SOF;
+                }
             } else if (byte == UART_FRAME_SOF) {
                 s_state = PARSER_STATE_READ_NODE_ID;
             } else {

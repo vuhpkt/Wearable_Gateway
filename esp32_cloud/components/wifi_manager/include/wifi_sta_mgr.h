@@ -26,3 +26,6 @@ uint32_t wifi_calculate_backoff_sec(uint32_t retry_count);
 
 /* RF Diagnostic Tool: Scan 2.4GHz APs and log RSSI/Channel/SSID */
 void wifi_scan_and_log_aps(void);
+
+/* Power Save Diagnostic */
+esp_err_t wifi_sta_get_power_save(int *out_ps_mode);

@@ -59,7 +59,7 @@ static void on_reconnect_timer(void *arg) {
     if (s_sta_stopped) {
         return;
     }
-    if (!s_is_connected && !s_connect_failed) {
+    if (!s_is_connected) {
         ESP_LOGI(TAG, "Retrying Wi-Fi connection: '%s' (Attempt #%lu)...",
                  s_current_ssid, (unsigned long)s_retry_count + 1);
         esp_err_t err = esp_wifi_connect();
@@ -167,13 +167,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         s_retry_count++;
         if (s_retry_count >= CONFIG_WIFI_MAX_RETRY) {
             s_connect_failed = true;
-            ESP_LOGE(TAG, "⚠️ Wi-Fi reached MAX retries (%d). Marking connect failed.", CONFIG_WIFI_MAX_RETRY);
+            ESP_LOGW(TAG, "⚠️ Wi-Fi disconnected (Attempt #%lu >= %d threshold). Continuing 30s background retry...",
+                     (unsigned long)s_retry_count, CONFIG_WIFI_MAX_RETRY);
+        } else {
+            ESP_LOGW(TAG, "Wi-Fi disconnected (Reason: %u, Attempt #%lu). Retrying in %lu seconds...",
+                     reason, (unsigned long)s_retry_count, (unsigned long)backoff_sec);
         }
 
-        ESP_LOGW(TAG, "Wi-Fi disconnected (Reason: %u, Attempt #%lu). Retrying in %lu seconds...",
-                 reason, (unsigned long)s_retry_count, (unsigned long)backoff_sec);
-
-        if (s_reconnect_timer != NULL && !s_connect_failed) {
+        /* [H05 FIX] Always arm reconnect timer (never give up in 24/7 gateway) */
+        if (s_reconnect_timer != NULL && !s_sta_stopped) {
             esp_timer_stop(s_reconnect_timer);
             esp_timer_start_once(s_reconnect_timer, (uint64_t)backoff_sec * 1000000ULL);
         }
@@ -337,7 +339,10 @@ esp_err_t wifi_sta_init_with_creds(const char *ssid, const char *password) {
     }
 
     /* Level 1 Power Optimization: Enable minimum modem sleep to shut off RF/PHY between DTIM beacons */
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    if (ps_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set Wi-Fi power save mode: %s", esp_err_to_name(ps_err));
+    }
     esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW20);
 
     /* Limit TX power to 17 dBm (input 68 quantized to 66 in IDF v6.0.2) to prevent close-range distortion */
@@ -406,4 +411,14 @@ esp_err_t wifi_sta_wait_time_sync(uint32_t timeout_ms) {
         return ESP_OK;
     }
     return wifi_sta_is_time_synced() ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t wifi_sta_get_power_save(int *out_ps_mode) {
+    if (out_ps_mode == NULL) return ESP_ERR_INVALID_ARG;
+    wifi_ps_type_t ps_type = WIFI_PS_NONE;
+    esp_err_t err = esp_wifi_get_ps(&ps_type);
+    if (err == ESP_OK) {
+        *out_ps_mode = (int)ps_type;
+    }
+    return err;
 }

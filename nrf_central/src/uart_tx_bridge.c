@@ -87,6 +87,12 @@ int uart_tx_bridge_send(const uint8_t *data, size_t len) {
     if (ret != 0) {
         LOG_ERR("UART EasyDMA TX timeout, aborting transmission");
         uart_tx_abort(s_uart_dev);
+        int abort_ret = k_sem_take(&tx_done_sem, K_MSEC(50));
+        if (abort_ret != 0) {
+            LOG_ERR("UART abort semaphore wait timed out, resetting sem");
+            k_sem_reset(&tx_done_sem);
+        }
+        ret = -ETIMEDOUT;
     }
 
     k_mutex_unlock(&tx_mutex);
@@ -114,6 +120,12 @@ int uart_tx_bridge_send_frame(uint8_t node_id, uint8_t pkt_type, const void *pay
     if (ret != 0) {
         LOG_ERR("UART EasyDMA TX timeout, aborting transmission");
         uart_tx_abort(s_uart_dev);
+        int abort_ret = k_sem_take(&tx_done_sem, K_MSEC(50));
+        if (abort_ret != 0) {
+            LOG_ERR("UART abort semaphore wait timed out, resetting sem");
+            k_sem_reset(&tx_done_sem);
+        }
+        ret = -ETIMEDOUT;
     }
 
     k_mutex_unlock(&tx_mutex);

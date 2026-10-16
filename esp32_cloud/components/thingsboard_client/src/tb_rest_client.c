@@ -21,11 +21,13 @@
 static const char *TAG = "tb_rest";
 
 typedef struct {
-    uint8_t node_id;
-    bool connected;
-} rest_cmd_t;
+    bool desired_connected;
+    bool dirty;
+    uint32_t generation;
+} node_desired_state_t;
 
-static QueueHandle_t s_rest_queue = NULL;
+static node_desired_state_t s_desired_states[MAX_NODES_SUPPORTED] = {{0}};
+static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_rest_task_handle = NULL;
 static char s_jwt_token[1024] = {0};
 static time_t s_token_expiry = 0;
@@ -42,15 +44,17 @@ void *tb_rest_get_task_handle(void) {
 }
 
 void tb_rest_set_node_connected(uint8_t node_id, bool connected) {
-    if (s_rest_queue == NULL || node_id >= MAX_NODES_SUPPORTED) {
+    if (node_id >= MAX_NODES_SUPPORTED) {
         return;
     }
-    rest_cmd_t cmd = {
-        .node_id = node_id,
-        .connected = connected
-    };
-    if (xQueueSend(s_rest_queue, &cmd, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "REST command queue full! Dropping command for Node %u", node_id + 1);
+    portENTER_CRITICAL(&s_state_lock);
+    s_desired_states[node_id].desired_connected = connected;
+    s_desired_states[node_id].dirty = true;
+    s_desired_states[node_id].generation++;
+    portEXIT_CRITICAL(&s_state_lock);
+
+    if (s_rest_task_handle != NULL) {
+        xTaskNotifyGive(s_rest_task_handle);
     }
 }
 
@@ -146,6 +150,7 @@ static esp_err_t tb_rest_login(void) {
         .timeout_ms = 8000,
         .buffer_size = 4096,
         .buffer_size_tx = 2048,
+        .crt_bundle_attach = esp_crt_bundle_attach,
         .event_handler = http_event_handler,
         .user_data = &resp_ctx,
     };
@@ -217,6 +222,7 @@ static esp_err_t tb_rest_resolve_device_uuid(uint8_t node_id, char *out_uuid, si
         .timeout_ms = 8000,
         .buffer_size = 4096,
         .buffer_size_tx = 2048,
+        .crt_bundle_attach = esp_crt_bundle_attach,
         .event_handler = http_event_handler,
         .user_data = &resp_ctx,
     };
@@ -280,6 +286,7 @@ static esp_err_t tb_rest_set_attribute(const char *device_uuid, bool connected, 
         .timeout_ms = 8000,
         .buffer_size = 2048,
         .buffer_size_tx = 2048,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -327,67 +334,76 @@ static esp_err_t tb_rest_set_attribute(const char *device_uuid, bool connected, 
 
 static void tb_rest_task(void *pvParameters) {
     (void)pvParameters;
-    rest_cmd_t cmd;
 
     while (1) {
-        if (xQueueReceive(s_rest_queue, &cmd, portMAX_DELAY)) {
-            if (cmd.node_id >= MAX_NODES_SUPPORTED) {
+        /* Wait for notification from tb_rest_set_node_connected() or timeout every 2 seconds */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
+
+        if (!wifi_sta_is_connected()) {
+            continue;
+        }
+
+        for (uint8_t i = 0; i < MAX_NODES_SUPPORTED; i++) {
+            bool need_sync = false;
+            bool target_state = false;
+            uint32_t gen = 0;
+
+            portENTER_CRITICAL(&s_state_lock);
+            if (s_desired_states[i].dirty) {
+                need_sync = true;
+                target_state = s_desired_states[i].desired_connected;
+                gen = s_desired_states[i].generation;
+            }
+            portEXIT_CRITICAL(&s_state_lock);
+
+            if (!need_sync) {
                 continue;
             }
 
-            if (!wifi_sta_is_connected()) {
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                xQueueSend(s_rest_queue, &cmd, 0);
-                continue;
-            }
-
+            /* Ensure JWT token is valid */
             time_t now = 0;
             time(&now);
             if (s_jwt_token[0] == '\0' || (now > 1700000000 && now >= s_token_expiry)) {
                 if (tb_rest_login() != ESP_OK) {
                     vTaskDelay(pdMS_TO_TICKS(3000));
-                    xQueueSend(s_rest_queue, &cmd, 0);
-                    continue;
+                    break; /* Try next round */
                 }
             }
 
             /* Dynamically resolve device UUID from ThingsBoard if not cached */
-            if (s_node_uuid_cache[cmd.node_id][0] == '\0') {
+            if (s_node_uuid_cache[i][0] == '\0') {
                 char resolved[37] = {0};
-                if (tb_rest_resolve_device_uuid(cmd.node_id, resolved, sizeof(resolved)) == ESP_OK) {
-                    memcpy(s_node_uuid_cache[cmd.node_id], resolved, 37);
+                if (tb_rest_resolve_device_uuid(i, resolved, sizeof(resolved)) == ESP_OK) {
+                    memcpy(s_node_uuid_cache[i], resolved, 37);
                 } else {
-                    ESP_LOGW(TAG, "Could not resolve UUID for Node%u. Retrying in 3s...", cmd.node_id + 1);
-                    vTaskDelay(pdMS_TO_TICKS(3000));
-                    xQueueSend(s_rest_queue, &cmd, 0);
+                    ESP_LOGW(TAG, "Could not resolve UUID for Node%u. Will retry...", i + 1);
+                    vTaskDelay(pdMS_TO_TICKS(1000));
                     continue;
                 }
             }
 
             int http_status = 0;
-            esp_err_t set_err = tb_rest_set_attribute(s_node_uuid_cache[cmd.node_id], cmd.connected, &http_status);
-            if (set_err != ESP_OK) {
+            esp_err_t set_err = tb_rest_set_attribute(s_node_uuid_cache[i], target_state, &http_status);
+            if (set_err == ESP_OK) {
+                portENTER_CRITICAL(&s_state_lock);
+                /* Only clear dirty flag if no newer state was posted while HTTP was in flight */
+                if (s_desired_states[i].generation == gen) {
+                    s_desired_states[i].dirty = false;
+                }
+                portEXIT_CRITICAL(&s_state_lock);
+            } else {
                 if (http_status == 404) {
                     /* Node was deleted/recreated on ThingsBoard -> invalidate cache to re-resolve */
-                    ESP_LOGW(TAG, "UUID for Node%u returned 404. Invalidating cache to refresh.", cmd.node_id + 1);
-                    s_node_uuid_cache[cmd.node_id][0] = '\0';
+                    ESP_LOGW(TAG, "UUID for Node%u returned 404. Invalidating cache to refresh.", i + 1);
+                    s_node_uuid_cache[i][0] = '\0';
                 }
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                xQueueSend(s_rest_queue, &cmd, 0);
+                vTaskDelay(pdMS_TO_TICKS(1000));
             }
         }
     }
 }
 
 esp_err_t tb_rest_client_init(void) {
-    if (s_rest_queue == NULL) {
-        s_rest_queue = xQueueCreate(16, sizeof(rest_cmd_t));
-        if (s_rest_queue == NULL) {
-            ESP_LOGE(TAG, "Failed to create REST command queue");
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
     BaseType_t ret = xTaskCreatePinnedToCore(
         tb_rest_task,
         "tb_rest_task",
@@ -403,6 +419,6 @@ esp_err_t tb_rest_client_init(void) {
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "TB REST Client initialized successfully (Dynamic UUID Engine Ready)");
+    ESP_LOGI(TAG, "TB REST Client initialized successfully (Desired-State Engine Ready)");
     return ESP_OK;
 }
