@@ -36,6 +36,9 @@ typedef struct {
 static node_desired_state_t s_desired_states[MAX_NODES_SUPPORTED] = {{0}};
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_rest_task_handle = NULL;
+#define TB_REST_TASK_STACK_SIZE 12288
+static StaticTask_t s_rest_task_tcb;
+static StackType_t s_rest_task_stack[TB_REST_TASK_STACK_SIZE / sizeof(StackType_t)];
 
 #ifndef HOST_TEST
 static char s_jwt_token[1024] = {0};
@@ -474,6 +477,24 @@ static void tb_rest_task(void *pvParameters) {
                 }
             }
 
+            /* Recheck node desired state before making HTTP request in case a newer status arrived */
+            bool current_target_state = false;
+            uint32_t current_gen = 0;
+            bool still_dirty = false;
+            portENTER_CRITICAL(&s_state_lock);
+            if (s_desired_states[i].rest_dirty) {
+                still_dirty = true;
+                current_target_state = s_desired_states[i].desired_connected;
+                current_gen = s_desired_states[i].generation;
+            }
+            portEXIT_CRITICAL(&s_state_lock);
+
+            if (!still_dirty) {
+                continue;
+            }
+            target_state = current_target_state;
+            gen = current_gen;
+
             int http_status = 0;
             esp_err_t set_err = tb_rest_set_attribute(s_node_uuid_cache[i], target_state, &http_status);
             if (set_err == ESP_OK) {
@@ -506,21 +527,22 @@ esp_err_t tb_rest_client_init(void) {
         return ESP_OK;
     }
 
-    BaseType_t ret = xTaskCreatePinnedToCore(
+    s_rest_task_handle = xTaskCreateStaticPinnedToCore(
         tb_rest_task,
         "tb_rest_task",
-        12288,
+        TB_REST_TASK_STACK_SIZE,
         NULL,
-        3,
-        &s_rest_task_handle,
+        3, /* Priority 3 as per contract */
+        s_rest_task_stack,
+        &s_rest_task_tcb,
         0  /* Core 0 */
     );
 
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create tb_rest_task");
+    if (s_rest_task_handle == NULL) {
+        ESP_LOGE(TAG, "Failed to create static tb_rest_task");
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "TB REST Client initialized successfully (Desired-State Engine Ready)");
+    ESP_LOGI(TAG, "TB REST Client initialized successfully (Static Task on Core 0)");
     return ESP_OK;
 }

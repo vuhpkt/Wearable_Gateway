@@ -9,11 +9,15 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef HOST_TEST
+#include "gateway_host_port.h"
+#else
 #include "esp_err.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#endif
 
 #include "wifi_ap.h"
 #include "wifi_portal.h"
@@ -98,24 +102,56 @@ static bool get_query_param(const char *body, const char *key, char *out_val, si
     return false;
 }
 
+#define PROV_TRANS_TASK_STACK_SIZE 3072
+static StaticTask_t s_prov_task_tcb;
+static StackType_t s_prov_task_stack[PROV_TRANS_TASK_STACK_SIZE / sizeof(StackType_t)];
+static TaskHandle_t s_prov_task_handle = NULL;
+
 typedef struct {
     char ssid[33];
     char pass[65];
-} transition_params_t;
+    bool pending;
+} prov_mailbox_t;
 
-static void async_transition_task(void *pvParameters) {
-    transition_params_t *params = (transition_params_t *)pvParameters;
-    vTaskDelay(pdMS_TO_TICKS(1000)); /* Allow HTTP response to flush over TCP */
+static prov_mailbox_t s_prov_mailbox = {0};
+static portMUX_TYPE s_prov_lock = portMUX_INITIALIZER_UNLOCKED;
 
-    if (s_creds_cb != NULL) {
-        s_creds_cb(params->ssid, params->pass);
+static void prov_worker_task(void *pvParameters) {
+    (void)pvParameters;
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        char local_ssid[33] = {0};
+        char local_pass[65] = {0};
+        bool has_creds = false;
+
+        portENTER_CRITICAL(&s_prov_lock);
+        if (s_prov_mailbox.pending) {
+            strncpy(local_ssid, s_prov_mailbox.ssid, sizeof(local_ssid) - 1);
+            strncpy(local_pass, s_prov_mailbox.pass, sizeof(local_pass) - 1);
+            /* Zero out sensitive credentials in mailbox immediately */
+            memset(&s_prov_mailbox, 0, sizeof(s_prov_mailbox));
+            has_creds = true;
+        }
+        portEXIT_CRITICAL(&s_prov_lock);
+
+        if (has_creds) {
+            /* Delay to allow HTTP response to flush over TCP before shutting down AP */
+            vTaskDelay(pdMS_TO_TICKS(1000));
+
+            if (s_creds_cb != NULL) {
+                s_creds_cb(local_ssid, local_pass);
+            }
+
+            /* Zero out local sensitive credentials */
+            memset(local_ssid, 0, sizeof(local_ssid));
+            memset(local_pass, 0, sizeof(local_pass));
+
+            portENTER_CRITICAL(&s_prov_lock);
+            s_transition_in_progress = false;
+            portEXIT_CRITICAL(&s_prov_lock);
+        }
     }
-
-    /* [L3 FIX] Zero out sensitive credentials in memory before freeing (CWE-226) */
-    memset(params->pass, 0, sizeof(params->pass));
-    memset(params->ssid, 0, sizeof(params->ssid));
-    free(params);
-    vTaskDelete(NULL);
 }
 
 static esp_err_t get_index_handler(httpd_req_t *req) {
@@ -186,21 +222,26 @@ static esp_err_t post_save_handler(httpd_req_t *req) {
             "<style>body{font-family:sans-serif;text-align:center;padding:40px;background:#0f172a;color:#fff;}h2{color:#4ade80;}</style></head>"
             "<body><h2>Credentials Saved!</h2><p>Connecting to Wi-Fi network...</p><p>You may reconnect to your home Wi-Fi.</p></body></html>";
 
+        /* Latch credentials into static resident worker mailbox */
+        portENTER_CRITICAL(&s_prov_lock);
+        if (s_transition_in_progress || s_prov_mailbox.pending) {
+            portEXIT_CRITICAL(&s_prov_lock);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Provisioning already in progress");
+            return ESP_FAIL;
+        }
+        s_transition_in_progress = true;
+        s_prov_mailbox.pending = true;
+        strncpy(s_prov_mailbox.ssid, ssid, sizeof(s_prov_mailbox.ssid) - 1);
+        s_prov_mailbox.ssid[sizeof(s_prov_mailbox.ssid) - 1] = '\0';
+        strncpy(s_prov_mailbox.pass, pass, sizeof(s_prov_mailbox.pass) - 1);
+        s_prov_mailbox.pass[sizeof(s_prov_mailbox.pass) - 1] = '\0';
+        portEXIT_CRITICAL(&s_prov_lock);
+
         httpd_resp_set_type(req, "text/html; charset=utf-8");
         httpd_resp_send(req, SUCCESS_HTML, HTTPD_RESP_USE_STRLEN);
 
-        /* [H1 FIX] Zeroed heap allocation with calloc ensuring null-termination (CWE-170) */
-        transition_params_t *params = calloc(1, sizeof(transition_params_t));
-        if (params) {
-            strncpy(params->ssid, ssid, sizeof(params->ssid) - 1);
-            strncpy(params->pass, pass, sizeof(params->pass) - 1);
-            s_transition_in_progress = true;
-            BaseType_t task_ok = xTaskCreate(async_transition_task, "prov_trans_tsk", 3072, params, 3, NULL);
-            if (task_ok != pdPASS) {
-                ESP_LOGE(TAG, "Failed to create async_transition_task");
-                s_transition_in_progress = false;
-                free(params);
-            }
+        if (s_prov_task_handle != NULL) {
+            xTaskNotifyGive(s_prov_task_handle);
         }
 
         return ESP_OK;
@@ -215,8 +256,29 @@ esp_err_t wifi_portal_start(wifi_portal_new_creds_cb_t on_creds_received) {
         return ESP_OK; /* Already running */
     }
 
+    portENTER_CRITICAL(&s_prov_lock);
     s_transition_in_progress = false;
+    memset(&s_prov_mailbox, 0, sizeof(s_prov_mailbox));
+    portEXIT_CRITICAL(&s_prov_lock);
     s_creds_cb = on_creds_received;
+
+    /* Ensure resident static worker is running */
+    if (s_prov_task_handle == NULL) {
+        s_prov_task_handle = xTaskCreateStaticPinnedToCore(
+            prov_worker_task,
+            "prov_trans_tsk",
+            PROV_TRANS_TASK_STACK_SIZE,
+            NULL,
+            3,
+            s_prov_task_stack,
+            &s_prov_task_tcb,
+            0  /* Core 0 */
+        );
+        if (s_prov_task_handle == NULL) {
+            ESP_LOGE(TAG, "Failed to create static prov_trans_tsk");
+            return ESP_FAIL;
+        }
+    }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 8;
@@ -252,7 +314,81 @@ void wifi_portal_stop(void) {
     if (s_server != NULL) {
         httpd_stop(s_server);
         s_server = NULL;
+        portENTER_CRITICAL(&s_prov_lock);
         s_transition_in_progress = false;
+        memset(&s_prov_mailbox, 0, sizeof(s_prov_mailbox));
+        portEXIT_CRITICAL(&s_prov_lock);
         ESP_LOGI(TAG, "Web Portal stopped.");
     }
 }
+
+#ifdef HOST_TEST
+/* Host test seam for Task 5b verification */
+bool wifi_portal_test_is_busy(void) {
+    portENTER_CRITICAL(&s_prov_lock);
+    bool busy = s_transition_in_progress || s_prov_mailbox.pending;
+    portEXIT_CRITICAL(&s_prov_lock);
+    return busy;
+}
+
+bool wifi_portal_test_mailbox_has_creds(char *out_ssid, size_t ssid_len, char *out_pass, size_t pass_len) {
+    portENTER_CRITICAL(&s_prov_lock);
+    bool pending = s_prov_mailbox.pending;
+    if (pending) {
+        if (out_ssid && ssid_len > 0) {
+            strncpy(out_ssid, s_prov_mailbox.ssid, ssid_len - 1);
+            out_ssid[ssid_len - 1] = '\0';
+        }
+        if (out_pass && pass_len > 0) {
+            strncpy(out_pass, s_prov_mailbox.pass, pass_len - 1);
+            out_pass[pass_len - 1] = '\0';
+        }
+    }
+    portEXIT_CRITICAL(&s_prov_lock);
+    return pending;
+}
+
+void wifi_portal_test_step_worker(void) {
+    char local_ssid[33] = {0};
+    char local_pass[65] = {0};
+    bool has_creds = false;
+
+    portENTER_CRITICAL(&s_prov_lock);
+    if (s_prov_mailbox.pending) {
+        strncpy(local_ssid, s_prov_mailbox.ssid, sizeof(local_ssid) - 1);
+        strncpy(local_pass, s_prov_mailbox.pass, sizeof(local_pass) - 1);
+        memset(&s_prov_mailbox, 0, sizeof(s_prov_mailbox));
+        has_creds = true;
+    }
+    portEXIT_CRITICAL(&s_prov_lock);
+
+    if (has_creds) {
+        if (s_creds_cb != NULL) {
+            s_creds_cb(local_ssid, local_pass);
+        }
+        memset(local_ssid, 0, sizeof(local_ssid));
+        memset(local_pass, 0, sizeof(local_pass));
+
+        portENTER_CRITICAL(&s_prov_lock);
+        s_transition_in_progress = false;
+        portEXIT_CRITICAL(&s_prov_lock);
+    }
+}
+
+esp_err_t wifi_portal_test_post_save(httpd_req_t *req) {
+    return post_save_handler(req);
+}
+
+TaskHandle_t wifi_portal_test_get_worker_handle(void) {
+    return s_prov_task_handle;
+}
+
+void wifi_portal_test_reset(void) {
+    portENTER_CRITICAL(&s_prov_lock);
+    s_transition_in_progress = false;
+    memset(&s_prov_mailbox, 0, sizeof(s_prov_mailbox));
+    portEXIT_CRITICAL(&s_prov_lock);
+    s_server = NULL;
+    s_creds_cb = NULL;
+}
+#endif
