@@ -58,6 +58,15 @@ static const ble_central_callbacks_t *s_cbs = NULL;
 static bool s_is_connecting = false;
 static struct bt_conn *s_connecting_conn = NULL;
 
+typedef struct {
+    uint32_t gen;
+    struct bt_conn *conn;
+    int64_t deadline;
+} handshake_timeout_ticket_t;
+
+static uint32_t s_handshake_gen = 0;
+static handshake_timeout_ticket_t s_timeout_ticket = {0};
+
 static struct k_timer s_handshake_timer;
 static struct k_work s_handshake_timeout_work;
 
@@ -65,6 +74,7 @@ static struct k_work s_handshake_timeout_work;
 static void device_found_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type, struct net_buf_simple *ad);
 static void start_gatt_discovery(struct bt_conn *conn);
 static void handshake_abort(struct bt_conn *conn);
+static void handshake_session_cleanup(struct bt_conn *conn);
 static void subscribe_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_subscribe_params *params);
 static void handshake_timeout_work_handler(struct k_work *work);
 static void handshake_timer_expiry_fn(struct k_timer *timer);
@@ -137,11 +147,32 @@ static void handshake_abort(struct bt_conn *conn) {
     bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 }
 
+static void handshake_session_cleanup(struct bt_conn *conn) {
+    if (s_connecting_conn == conn) {
+        s_handshake_gen++;
+        k_timer_stop(&s_handshake_timer);
+        k_work_cancel(&s_handshake_timeout_work);
+        s_connecting_conn = NULL;
+        s_is_connecting = false;
+    }
+}
+
 static void handshake_timeout_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
-    if (s_is_connecting && s_connecting_conn != NULL) {
-        LOG_WRN("[BLE] Handshake timed out after %u ms. Aborting stuck connection...",
-                BLE_HANDSHAKE_TIMEOUT_MS);
+    /* Invariant Check (Task 3b):
+     * Abort ONLY if:
+     * 1. FSM is actively in connecting state (s_is_connecting == true)
+     * 2. Current connecting conn matches ticket conn (s_connecting_conn == s_timeout_ticket.conn)
+     * 3. Generation matches ticket gen (s_handshake_gen == s_timeout_ticket.gen)
+     * 4. Current uptime has reached or exceeded ticket deadline (k_uptime_get() >= s_timeout_ticket.deadline)
+     * Exact reference: C:/ncs/v3.4.0/zephyr/include/zephyr/kernel.h: k_work_cancel, k_timer_stop
+     */
+    if (s_is_connecting && s_connecting_conn != NULL &&
+        s_connecting_conn == s_timeout_ticket.conn &&
+        s_handshake_gen == s_timeout_ticket.gen &&
+        k_uptime_get() >= s_timeout_ticket.deadline) {
+        LOG_WRN("[BLE] Handshake timed out after %u ms (gen=%u). Aborting stuck connection %p...",
+                BLE_HANDSHAKE_TIMEOUT_MS, s_timeout_ticket.gen, (void *)s_connecting_conn);
         handshake_abort(s_connecting_conn);
     }
 }
@@ -173,12 +204,8 @@ static void subscribe_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_subsc
             slot->slot_id);
     slot->state = NODE_STATE_SUBSCRIBED;
 
-    /* Handshake complete: cancel timer and release sequential connection lock */
-    k_timer_stop(&s_handshake_timer);
-    if (s_connecting_conn == conn) {
-        s_is_connecting = false;
-        s_connecting_conn = NULL;
-    }
+    /* Handshake complete: cancel timer, cancel pending work, and release sequential lock */
+    handshake_session_cleanup(conn);
 
     /* If available slots remain, automatically resume scanning for next node */
     if (ble_node_slots_get_active_count() < BLE_NODE_MAX_SLOTS) {
@@ -346,9 +373,7 @@ static void connected_cb(struct bt_conn *conn, uint8_t err) {
             ble_node_slot_free(slot);
         }
         if (s_connecting_conn == conn) {
-            k_timer_stop(&s_handshake_timer);
-            s_connecting_conn = NULL;
-            s_is_connecting = false;
+            handshake_session_cleanup(conn);
         }
         ble_central_mgr_scan_start();
         return;
@@ -358,9 +383,7 @@ static void connected_cb(struct bt_conn *conn, uint8_t err) {
         LOG_ERR("No slot allocated for connected node [%s]", addr_str);
         bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
         if (s_connecting_conn == conn) {
-            k_timer_stop(&s_handshake_timer);
-            s_connecting_conn = NULL;
-            s_is_connecting = false;
+            handshake_session_cleanup(conn);
         }
         ble_central_mgr_scan_start();
         return;
@@ -406,12 +429,10 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason) {
         s_cbs->disconnected(slot_id, bt_conn_get_dst(conn), reason);
     }
 
-    /* M07: Reset connecting lock and timer ONLY if the disconnected connection was in handshake */
+    /* M07: Reset connecting lock, timer, and pending work ONLY if the disconnected connection was in handshake */
     if (s_connecting_conn == conn) {
-        LOG_DBG("[BLE] Handshake connection terminated. Releasing lock and stopping timer.");
-        k_timer_stop(&s_handshake_timer);
-        s_connecting_conn = NULL;
-        s_is_connecting = false;
+        LOG_DBG("[BLE] Handshake connection terminated. Releasing lock and cleaning up session.");
+        handshake_session_cleanup(conn);
         /* Safe to resume scanning now */
         ble_central_mgr_scan_start();
     } else {
@@ -521,12 +542,17 @@ static void device_found_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
         if (err != 0) {
             LOG_ERR("Connection initiation failed (err %d)", err);
             ble_node_slot_free(slot);
+            s_handshake_gen++;
             s_is_connecting = false;
             s_connecting_conn = NULL;
             ble_central_mgr_scan_start();
         } else {
-            /* Handshake lock acquired: track connection and arm 5-second deadline */
+            /* Handshake lock acquired: increment generation, record ticket and arm 5-second deadline */
+            s_handshake_gen++;
             s_connecting_conn = slot->conn;
+            s_timeout_ticket.gen = s_handshake_gen;
+            s_timeout_ticket.conn = slot->conn;
+            s_timeout_ticket.deadline = k_uptime_get() + BLE_HANDSHAKE_TIMEOUT_MS;
             k_timer_start(&s_handshake_timer, K_MSEC(BLE_HANDSHAKE_TIMEOUT_MS), K_NO_WAIT);
         }
     }
@@ -580,3 +606,73 @@ int ble_central_mgr_scan_start(void) {
 int ble_central_mgr_scan_stop(void) {
     return bt_le_scan_stop();
 }
+
+#ifdef HOST_TEST
+/* ══════════════════════════════════════════════════════════════
+ *  Host Unit Test Seam (Task 3a / 3b)
+ * ══════════════════════════════════════════════════════════════ */
+uint32_t ble_central_mgr_get_handshake_gen(void) {
+    return s_handshake_gen;
+}
+
+bool ble_central_mgr_is_connecting(void) {
+    return s_is_connecting;
+}
+
+struct bt_conn *ble_central_mgr_get_connecting_conn(void) {
+    return s_connecting_conn;
+}
+
+void ble_central_mgr_test_arm_timeout(struct bt_conn *conn) {
+    s_is_connecting = true;
+    s_handshake_gen++;
+    s_connecting_conn = conn;
+    s_timeout_ticket.gen = s_handshake_gen;
+    s_timeout_ticket.conn = conn;
+    s_timeout_ticket.deadline = k_uptime_get() + BLE_HANDSHAKE_TIMEOUT_MS;
+    k_timer_start(&s_handshake_timer, K_MSEC(BLE_HANDSHAKE_TIMEOUT_MS), K_NO_WAIT);
+}
+
+void ble_central_mgr_test_timer_expiry(void) {
+    handshake_timer_expiry_fn(&s_handshake_timer);
+}
+
+void ble_central_mgr_test_work_handler(void) {
+    handshake_timeout_work_handler(&s_handshake_timeout_work);
+}
+
+void ble_central_mgr_test_session_cleanup(struct bt_conn *conn) {
+    handshake_session_cleanup(conn);
+}
+
+void ble_central_mgr_test_subscribe_cb(struct bt_conn *conn, uint8_t err) {
+    subscribe_cb(conn, err, NULL);
+}
+
+void ble_central_mgr_test_disconnected_cb(struct bt_conn *conn, uint8_t reason) {
+    disconnected_cb(conn, reason);
+}
+
+void ble_central_mgr_test_init(void) {
+    k_timer_init(&s_handshake_timer, handshake_timer_expiry_fn, NULL);
+    k_work_init(&s_handshake_timeout_work, handshake_timeout_work_handler);
+    s_is_connecting = false;
+    s_connecting_conn = NULL;
+    s_handshake_gen = 0;
+    memset(&s_timeout_ticket, 0, sizeof(s_timeout_ticket));
+}
+
+void ble_central_mgr_test_set_ticket_for_race_test(uint32_t gen, struct bt_conn *conn, int64_t deadline) {
+    s_timeout_ticket.gen = gen;
+    s_timeout_ticket.conn = conn;
+    s_timeout_ticket.deadline = deadline;
+}
+
+struct k_timer *ble_central_mgr_test_get_timer(void) {
+    return &s_handshake_timer;
+}
+
+struct k_work *ble_central_mgr_test_get_work(void) {
+    return &s_handshake_timeout_work;
+}
+#endif
