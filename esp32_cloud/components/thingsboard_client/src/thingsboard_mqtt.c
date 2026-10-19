@@ -71,8 +71,15 @@ esp_err_t tb_mqtt_init(const char *broker_uri, const char *access_token) {
     esp_mqtt_client_config_t config = {
         .broker.address.uri = broker_uri,
         .credentials.username = access_token,
-        .network.timeout_ms = 1000,
-        .session.keepalive = 15};
+        .network = {
+            .timeout_ms = 10000,
+            .reconnect_timeout_ms = 10000,
+            .disable_auto_reconnect = false,
+        },
+        .session = {
+            .keepalive = 60,
+        },
+    };
 
     s_client = esp_mqtt_client_init(&config);
     if (s_client == NULL) {
