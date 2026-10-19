@@ -226,7 +226,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("time.google.com");
 #endif
             sntp_config.sync_cb = sntp_sync_notification_cb;
-            sntp_config.server_from_dhcp = true;
+            sntp_config.server_from_dhcp = false;
             sntp_config.renew_servers_after_new_IP = true;
 
             esp_err_t sntp_err = esp_netif_sntp_init(&sntp_config);
