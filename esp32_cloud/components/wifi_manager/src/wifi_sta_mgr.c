@@ -136,6 +136,15 @@ void wifi_scan_and_log_aps(void) {
     }
 }
 
+static void sntp_sync_notification_cb(struct timeval *tv) {
+    time_t now = tv ? tv->tv_sec : time(NULL);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    char strftime_buf[64];
+    strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    ESP_LOGI(TAG, "⏰ [SNTP] Time synchronized! Current RTC: %s (epoch=%lld)", strftime_buf, (long long)now);
+}
+
 static void on_sntp_resync_timer(void *arg) {
     (void)arg;
     if (s_is_connected) {
@@ -208,11 +217,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 
         static bool s_sntp_initialized = false;
         if (!s_sntp_initialized) {
-            esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+#if CONFIG_LWIP_SNTP_MAX_SERVERS >= 3
+            esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
+                3,
+                ESP_SNTP_SERVER_LIST("time.google.com", "time.cloudflare.com", "pool.ntp.org")
+            );
+#else
+            esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("time.google.com");
+#endif
+            sntp_config.sync_cb = sntp_sync_notification_cb;
+            sntp_config.server_from_dhcp = true;
+            sntp_config.renew_servers_after_new_IP = true;
+
             esp_err_t sntp_err = esp_netif_sntp_init(&sntp_config);
             if (sntp_err == ESP_OK) {
                 s_sntp_initialized = true;
-                ESP_LOGI(TAG, "⏰ [SNTP] Real-time clock synchronization started via pool.ntp.org");
+                ESP_LOGI(TAG, "⏰ [SNTP] Real-time clock synchronization started (time.google.com / time.cloudflare.com / pool.ntp.org)");
 
                 if (s_sntp_resync_timer == NULL) {
                     esp_timer_create_args_t tmr_args = {
@@ -228,6 +248,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             } else {
                 ESP_LOGE(TAG, "Failed to initialize SNTP: %s", esp_err_to_name(sntp_err));
             }
+        } else {
+            esp_netif_sntp_start();
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
         /* [H8 FIX] L3 IP lease expired or revoked. Mark disconnected immediately */
@@ -397,8 +419,13 @@ esp_err_t wifi_sta_wait_connected(TickType_t timeout_ticks) {
     return ESP_OK;
 }
 
-/* [M7 FIX] Official ESP-IDF SNTP synchronization status check */
+/* [M7 FIX] Official ESP-IDF SNTP synchronization status check with calendar epoch guard */
 bool wifi_sta_is_time_synced(void) {
+    time_t now = 0;
+    time(&now);
+    if (now > 1700000000) {
+        return true;
+    }
     return (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED);
 }
 

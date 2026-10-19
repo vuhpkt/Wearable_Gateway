@@ -26,3 +26,6 @@ CONFIG_LOG_COLORS=y
 # Partition Table: Single factory app, large (nearly 2MB)
 CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 
+# SNTP: Multi-server pool support for reliable real-time sync
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
+
