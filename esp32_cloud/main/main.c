@@ -96,6 +96,29 @@ static void on_mqtt_connected(void) {
     ESP_LOGI(TAG, "🔄 MQTT (Re)Connected: Reset announcement cache and marked all seen nodes dirty");
 }
 
+static bool publish_node_status_mqtt(uint8_t node_id, bool connected, uint32_t generation, const char *log_prefix) {
+    const char *topic = NULL;
+    char status_buf[64];
+    int len = synth_format_node_status(status_buf, sizeof(status_buf), node_id, connected, &topic);
+    if (len <= 0 || topic == NULL) {
+        return false;
+    }
+
+    int msg_id = tb_mqtt_publish(topic, status_buf, 1);
+    if (msg_id >= 0) {
+        metrics_inc_mqtt_published();
+        s_node_announced[node_id] = connected;
+        tb_rest_ack_mqtt_synced(node_id, generation);
+        ESP_LOGI(TAG, "📡 %s v1/gateway/%s for Node%u (gen=%lu)",
+                 log_prefix, connected ? "connect" : "disconnect",
+                 node_id + 1, (unsigned long)generation);
+        return true;
+    }
+
+    metrics_inc_mqtt_dropped();
+    return false;
+}
+
 static void reconcile_mqtt_node_status(void) {
     if (!tb_mqtt_is_connected()) {
         return;
@@ -103,45 +126,18 @@ static void reconcile_mqtt_node_status(void) {
     for (uint8_t i = 0; i < MAX_NODES_SUPPORTED; i++) {
         tb_node_state_snapshot_t snap;
         if (tb_rest_get_mqtt_pending_sync(i, &snap)) {
-            const char *topic = NULL;
-            char status_buf[64];
-            int len = synth_format_node_status(status_buf, sizeof(status_buf), i, snap.desired_connected, &topic);
-            if (len > 0 && topic != NULL) {
-                int msg_id = tb_mqtt_publish(topic, status_buf, 1);
-                if (msg_id >= 0) {
-                    metrics_inc_mqtt_published();
-                    s_node_announced[i] = snap.desired_connected;
-                    tb_rest_ack_mqtt_synced(i, snap.generation);
-                    ESP_LOGI(TAG, "📡 Reconciled MQTT v1/gateway/%s for Node%u (gen=%lu)",
-                             snap.desired_connected ? "connect" : "disconnect", i + 1, (unsigned long)snap.generation);
-                } else {
-                    metrics_inc_mqtt_dropped();
-                }
-            }
+            publish_node_status_mqtt(i, snap.desired_connected, snap.generation, "Reconciled MQTT");
         }
     }
 }
 
 static void ensure_node_connected(uint8_t node_id) {
-    if (node_id >= MAX_NODES_SUPPORTED) return;
-    if (!s_node_announced[node_id] && tb_mqtt_is_connected()) {
-        tb_node_state_snapshot_t snap;
-        if (tb_rest_get_node_snapshot(node_id, &snap) && snap.desired_connected) {
-            const char *topic = NULL;
-            char connect_buf[64];
-            int len = synth_format_node_status(connect_buf, sizeof(connect_buf), node_id, true, &topic);
-            if (len > 0 && topic != NULL) {
-                int msg_id = tb_mqtt_publish(topic, connect_buf, 1);
-                if (msg_id >= 0) {
-                    metrics_inc_mqtt_published();
-                    s_node_announced[node_id] = true;
-                    tb_rest_ack_mqtt_synced(node_id, snap.generation);
-                    ESP_LOGI(TAG, "📡 Auto-announced v1/gateway/connect activation for Node%u", node_id + 1);
-                } else {
-                    metrics_inc_mqtt_dropped();
-                }
-            }
-        }
+    if (node_id >= MAX_NODES_SUPPORTED || s_node_announced[node_id] || !tb_mqtt_is_connected()) {
+        return;
+    }
+    tb_node_state_snapshot_t snap;
+    if (tb_rest_get_node_snapshot(node_id, &snap) && snap.desired_connected) {
+        publish_node_status_mqtt(node_id, true, snap.generation, "Auto-announced activation");
     }
 }
 

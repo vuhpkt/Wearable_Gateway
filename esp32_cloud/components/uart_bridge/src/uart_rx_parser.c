@@ -5,6 +5,7 @@
 #include <esp_log.h>
 
 /* Project Local Headers */
+#include "ble_protocol_def.h"
 #include "uart_rx_parser.h"
 
 
@@ -17,6 +18,28 @@ static uint8_t s_crc_buffer[3 + UART_MAX_PAYLOAD_LEN];
 static uart_frame_cb_t s_frame_cb = NULL;
 static uint32_t s_valid_frames = 0;
 static uint32_t s_crc_errors = 0;
+
+static inline void handle_sync_error(uint8_t byte) {
+    /* If the unexpected byte is a genuine SOF (0xAA), stay in READ_NODE_ID to resynchronize */
+    s_state = (byte == UART_FRAME_SOF) ? PARSER_STATE_READ_NODE_ID : PARSER_STATE_WAIT_SOF;
+}
+
+static bool is_valid_payload_len(uint8_t pkt_type, uint8_t len) {
+    if (len == 0 || len > UART_MAX_PAYLOAD_LEN) {
+        return false;
+    }
+    switch (pkt_type) {
+    case UART_PKT_TYPE_ECG_BATCH:
+        /* ECG batch payload must be an even byte length (1..64 int16 samples) */
+        return (len >= sizeof(int16_t)) && ((len % sizeof(int16_t)) == 0);
+    case UART_PKT_TYPE_VITALS:
+        return (len == sizeof(vitals_packet_t)); /* 5 bytes */
+    case UART_PKT_TYPE_NODE_STATUS:
+        return (len == 1);
+    default:
+        return true;
+    }
+}
 
 static void parse_byte(uint8_t byte) {
     switch (s_state) {
@@ -31,11 +54,8 @@ static void parse_byte(uint8_t byte) {
                 s_current_frame.node_id = byte;
                 s_crc_buffer[0] = byte;
                 s_state = PARSER_STATE_READ_PKT_TYPE;
-            } else if (byte == UART_FRAME_SOF) {
-                /* Vẫn có thể là SOF thật nếu byte trước là rác */
-                s_state = PARSER_STATE_READ_NODE_ID;
             } else {
-                s_state = PARSER_STATE_WAIT_SOF;
+                handle_sync_error(byte);
             }
             break;
 
@@ -47,41 +67,19 @@ static void parse_byte(uint8_t byte) {
                 s_current_frame.pkt_type = byte;
                 s_crc_buffer[1] = byte;
                 s_state = PARSER_STATE_READ_LEN;
-            } else if (byte == UART_FRAME_SOF) {
-                s_state = PARSER_STATE_READ_NODE_ID;
             } else {
-                s_state = PARSER_STATE_WAIT_SOF;
+                handle_sync_error(byte);
             }
             break;  
 
         case PARSER_STATE_READ_LEN:
-            if (byte > 0 && byte <= UART_MAX_PAYLOAD_LEN) {
-                bool valid_len = true;
-                if (s_current_frame.pkt_type == UART_PKT_TYPE_ECG_BATCH) {
-                    /* ECG batch payload must be an even byte length (multiple of sizeof(int16_t), 1..64 samples) */
-                    if ((byte % sizeof(int16_t) != 0) || (byte < sizeof(int16_t))) {
-                        valid_len = false;
-                    }
-                } else if (s_current_frame.pkt_type == UART_PKT_TYPE_VITALS && byte != 5) {
-                    valid_len = false;
-                } else if (s_current_frame.pkt_type == UART_PKT_TYPE_NODE_STATUS && byte != 1) {
-                    valid_len = false;
-                }
-
-                if (valid_len) {
-                    s_current_frame.len = byte;
-                    s_crc_buffer[2] = byte;
-                    s_payload_idx = 0;
-                    s_state = PARSER_STATE_READ_PAYLOAD;
-                } else if (byte == UART_FRAME_SOF) {
-                    s_state = PARSER_STATE_READ_NODE_ID;
-                } else {
-                    s_state = PARSER_STATE_WAIT_SOF;
-                }
-            } else if (byte == UART_FRAME_SOF) {
-                s_state = PARSER_STATE_READ_NODE_ID;
+            if (is_valid_payload_len(s_current_frame.pkt_type, byte)) {
+                s_current_frame.len = byte;
+                s_crc_buffer[2] = byte;
+                s_payload_idx = 0;
+                s_state = PARSER_STATE_READ_PAYLOAD;
             } else {
-                s_state = PARSER_STATE_WAIT_SOF;
+                handle_sync_error(byte);
             }
             break;
 
