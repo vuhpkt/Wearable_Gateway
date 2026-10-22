@@ -24,6 +24,7 @@
 
 #include "wifi_manager.h"
 #include "uart_bridge.h"
+#include "gateway_ingest.h"
 #include "thingsboard_client.h"
 #include "cloud_uplink.h"
 #include "system_health.h"
