@@ -56,11 +56,11 @@ v1/gateway/telemetry
 ```
 
 ### 2.3. Cấu trúc Payload JSON (ThingsBoard Gateway Protocol)
-Payload gửi lên là một JSON Object gom nhóm theo tên thiết bị con (`Node0`, `Node1`, ... `Node9`):
+Payload gửi lên là một JSON Object gom nhóm theo địa chỉ MAC phần cứng của thiết bị (ví dụ `F0:F5:BD:11:22:33`, `F0:F5:BD:44:55:66`):
 
 ```json
 {
-  "Node0": [
+  "F0:F5:BD:11:22:33": [
     {
       "ts": 1712839200000,
       "values": {
@@ -72,7 +72,7 @@ Payload gửi lên là một JSON Object gom nhóm theo tên thiết bị con (`
       }
     }
   ],
-  "Node1": [
+  "F0:F5:BD:44:55:66": [
     {
       "ts": 1712839200000,
       "values": {

@@ -17,7 +17,7 @@
 6. **Data Integrity & Timing:** ESP32-S3 chịu trách nhiệm gán mốc thời gian vi sai đều đặn ($+4\text{ ms}$ cho mỗi mẫu ECG trong mảng $50\text{ mẫu}$) trước khi đóng gói gửi MQTT lên ThingsBoard.
 7. **ThingsBoard Rate-Limiting & Gateway API:**
    - ESP32-S3 gom dữ liệu theo chu kỳ $1\text{ s}$ đẩy 1 lần (Batching).
-   - Sử dụng **ThingsBoard Gateway API** (`v1/gateway/telemetry`) phân chia theo tên thiết bị (`Node_0` .. `Node_9`) để tránh bị Rate Limiter của ThingsBoard đóng kết nối TCP.
+   - Sử dụng **ThingsBoard Gateway API** (`v1/gateway/telemetry`) phân chia theo địa chỉ MAC phần cứng (`XX:XX:XX:XX:XX:XX`) để định danh độc lập thiết bị, tránh phụ thuộc vào số thứ tự slot.
 
 ---
 

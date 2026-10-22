@@ -22,7 +22,7 @@ Một chip đơn lẻ không thể vừa duy trì kết nối BLE đa kết nố
 ### 1.2. Architecture Solution: Dual-MCU Heterogeneous Gateway
 Giải pháp phân tách phần cứng chuyên biệt (Asymmetric Multi-Processing / Multi-Chip):
 - **MCU 1 (Radio Gateway / BLE Central):** Nordic **nRF52840** chạy Zephyr RTOS. Đảm nhiệm quét (Scan), kết nối (Connect lên đến 10 Node), đăng ký GATT Notification và đẩy dữ liệu thô sang UART với độ trễ tối thiểu.
-- **MCU 2 (Network & Cloud Gateway):** Espressif **ESP32-S3** (Dual-Core LX7 @ 240MHz, 8MB PSRAM, 16MB Flash) chạy ESP-IDF FreeRTOS. Đảm nhiệm phân tích khung UART, đồng bộ thời gian thực SNTP, đóng gói JSON chuẩn ThingsBoard Gateway Protocol, đẩy dữ liệu qua MQTT, và đồng bộ trạng thái `SERVER_SCOPE` qua REST API.
+- **MCU 2 (Network & Cloud Gateway):** Espressif **ESP32-S3** (Dual-Core LX7 @ 240MHz, 8MB PSRAM, 16MB Flash) chạy ESP-IDF FreeRTOS. Đảm nhiệm phân tích khung UART, đồng bộ thời gian thực SNTP, đóng gói JSON chuẩn ThingsBoard Gateway Protocol theo địa chỉ MAC-native, đẩy dữ liệu qua MQTT, và hỗ trợ quản trị Wi-Fi Captive Portal.
 
 ---
 
@@ -118,15 +118,9 @@ Khung truyền nhị phân có kiểm tra tính toàn vẹn CRC-8:
   ```
   *(Trường `ts` sử dụng Unix Epoch thời gian thực từ SNTP. Nếu chưa đồng bộ SNTP, Gateway hoãn publish hoặc báo lỗi `-2`, không bao giờ gửi timestamp năm 1970).*
 
-### 4.4. Tầng Cloud: ThingsBoard REST Synchronizer (Cho Web Dashboard LIVE Status)
-- **Hợp đồng giao diện Web Dashboard (`Wearable_Server`):**
-  - Web kiểm tra `map.connected === true` trong `SERVER_SCOPE` (`GET /api/plugins/telemetry/DEVICE/{uuid}/values/attributes/SERVER_SCOPE?keys=connected,patientName`).
-  - Nếu `SERVER_SCOPE.connected !== true`, giao diện hiển thị trạng thái `OFFLINE` và ép thẻ `VitalCard` về `--`.
-- **Nhiệm vụ của Gateway qua REST Client (`tb_rest_client.c`):**
-  1. Login lấy JWT Token: `POST /api/auth/login` với tài khoản quản trị. Cache JWT trong 2 giờ.
-  2. Phân giải động UUID (Dynamic UUID Resolution): Gọi `GET /api/tenant/devices?deviceName=NodeX` để lấy UUID thực tế của NodeX (tránh việc Node bị xóa và tạo lại làm đổi UUID).
-  3. Khi Node kết nối: `POST /api/plugins/telemetry/DEVICE/{uuid}/attributes/SERVER_SCOPE` với body `{"connected":true}`.
-  4. Khi Node ngắt kết nối: `POST /api/plugins/telemetry/DEVICE/{uuid}/attributes/SERVER_SCOPE` với body `{"connected":false}`.
+### 4.4. Tầng Cloud: MAC-Native MQTT Gateway & Passive Freshness Window
+- **Định danh MAC-Native:** Thiết bị được định danh bằng địa chỉ MAC phần cứng (`XX:XX:XX:XX:XX:XX`) trong toàn bộ topic Gateway (`v1/gateway/connect`, `v1/gateway/telemetry`, `v1/gateway/attributes`, `v1/gateway/disconnect`).
+- **Passive Freshness Window (5,000 ms):** Web Dashboard và backend API đánh giá trạng thái online/offline của từng stream dữ liệu dựa trên sliding window 5,000 ms (`serverNow - observedAt <= 5000 ms`). Module REST Client (`tb_rest_client.c`) và việc ghi `SERVER_SCOPE.connected` đã được loại bỏ hoàn toàn, giúp thu hồi 28KB SRAM và triệt tiêu 2–8 giây độ trễ HTTPS TLS.
 
 ---
 
@@ -139,15 +133,15 @@ Khung truyền nhị phân có kiểm tra tính toàn vẹn CRC-8:
 │  - Wi-Fi STA / SoftAP Driver & Event Loop                              │
 │  - SNTP Time Synchronization Service                                   │
 │  - cloud_consumer_task (Priority 5, Stack 4096B)                       │
-│      * Rút frame từ s_frame_queue, serialize JSON, publish MQTT        │
-│  - tb_rest_task (Priority 3, Stack 6144B)                              │
-│      * Background HTTPS Client, quản lý JWT và POST SERVER_SCOPE       │
+│      * Rút frame từ s_snapshot_queue, serialize JSON, publish MQTT      │
 ├────────────────────────────────────────────────────────────────────────┤
 │                        CORE 1 (APP_CPU)                                │
 │  - sensor_producer_task (Priority 10, Stack 4096B)                     │
 │      * Polling UART DMA/FIFO tốc độ cao 460800 baud                    │
-│      * Parser FSM + CRC-8, đóng gói uart_rx_frame_t                    │
-│      * Đẩy vào s_frame_queue (Capacity: 64 frames, Non-blocking)       │
+│      * Parser FSM + CRC-8, binding Core 1 gate session table           │
+│      * Đẩy tuple copy-by-value vào s_snapshot_queue (64 frames)        │
+└────────────────────────────────────────────────────────────────────────┘
+```
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -190,8 +184,7 @@ stateDiagram-v2
 3. **Mất nguồn / Node BLE ngắt kết nối đột ngột:**
    - Central nRF52840 phát hiện ngắt kết nối qua BLE supervision timeout.
    - Gửi ngay gói tin `UART_PKT_TYPE_NODE_STATUS` (`status = 0`) sang ESP32.
-   - ESP32 phát lệnh `v1/gateway/disconnect` lên MQTT và cập nhật `SERVER_SCOPE.connected = false` qua REST.
-   - Web Dashboard hiển thị ngay lập tức sang trạng thái `OFFLINE`.
+   - ESP32 phát lệnh `v1/gateway/disconnect` lên MQTT; Web Dashboard tự động chuyển sang `OFFLINE` khi hết 5,000 ms Freshness Window.
 
 ---
 
