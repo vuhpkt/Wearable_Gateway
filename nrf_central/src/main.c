@@ -19,30 +19,74 @@ LOG_MODULE_REGISTER(gateway_main, LOG_LEVEL_INF);
 static const struct gpio_dt_spec user_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 #define LED_BLINK_INTERVAL_MS 1000
 
-static void on_ble_connected(uint8_t node_id, const bt_addr_le_t *addr) {
-    uint8_t status = 1; /* 1 = Connected */
-    uart_tx_queue_send(node_id, UART_PKT_TYPE_NODE_STATUS, &status, sizeof(status));
+static void on_ble_connected(const ble_conn_context_t *ctx, const bt_addr_le_t *addr) {
+    ARG_UNUSED(addr);
+    uint8_t payload[sizeof(uart_v2_envelope_t) + sizeof(uart_node_status_pkt_t)];
+    uart_v2_envelope_t *env = (uart_v2_envelope_t *)payload;
+    uart_node_status_pkt_t *status = (uart_node_status_pkt_t *)(payload + sizeof(uart_v2_envelope_t));
+
+    env->bridge_epoch = uart_tx_bridge_get_active_epoch();
+    env->session_id = ctx->session_id;
+    env->seq = ctx->seq;
+    env->central_rx_mono_ms = ctx->rx_mono_ms;
+
+    status->status = 1; /* 1 = Connected */
+    memcpy(status->mac, ctx->mac, 6);
+
+    uart_tx_queue_send(ctx->slot_id, UART_PKT_TYPE_NODE_STATUS_V2, payload, sizeof(payload));
 }
 
-static void on_ble_disconnected(uint8_t node_id, const bt_addr_le_t *addr, uint8_t reason) {
-    uint8_t status = 0; /* 0 = Disconnected */
-    uart_tx_queue_send(node_id, UART_PKT_TYPE_NODE_STATUS, &status, sizeof(status));
+static void on_ble_disconnected(const ble_conn_context_t *ctx, const bt_addr_le_t *addr, uint8_t reason) {
+    ARG_UNUSED(addr);
+    ARG_UNUSED(reason);
+    uint8_t payload[sizeof(uart_v2_envelope_t) + sizeof(uart_node_status_pkt_t)];
+    uart_v2_envelope_t *env = (uart_v2_envelope_t *)payload;
+    uart_node_status_pkt_t *status = (uart_node_status_pkt_t *)(payload + sizeof(uart_v2_envelope_t));
+
+    env->bridge_epoch = uart_tx_bridge_get_active_epoch();
+    env->session_id = ctx->session_id;
+    env->seq = ctx->seq;
+    env->central_rx_mono_ms = ctx->rx_mono_ms;
+
+    status->status = 0; /* 0 = Disconnected */
+    memcpy(status->mac, ctx->mac, 6);
+
+    uart_tx_queue_send(ctx->slot_id, UART_PKT_TYPE_NODE_STATUS_V2, payload, sizeof(payload));
 }
 
-static void on_vitals_received(uint8_t node_id, const vitals_packet_t *vitals) {
-    uart_tx_queue_send(node_id, UART_PKT_TYPE_VITALS, vitals, sizeof(vitals_packet_t));
+static void on_vitals_received(const ble_conn_context_t *ctx, const vitals_packet_t *vitals) {
+    uint8_t payload[sizeof(uart_v2_envelope_t) + sizeof(vitals_packet_t)];
+    uart_v2_envelope_t *env = (uart_v2_envelope_t *)payload;
+
+    env->bridge_epoch = uart_tx_bridge_get_active_epoch();
+    env->session_id = ctx->session_id;
+    env->seq = ctx->seq;
+    env->central_rx_mono_ms = ctx->rx_mono_ms;
+
+    memcpy(payload + sizeof(uart_v2_envelope_t), vitals, sizeof(vitals_packet_t));
+    uart_tx_queue_send(ctx->slot_id, UART_PKT_TYPE_VITALS_V2, payload, sizeof(payload));
 }
 
-static void on_ecg_received(uint8_t node_id, const int16_t *samples, uint16_t count) {
-    uint8_t byte_len = (uint8_t)(count * sizeof(int16_t));
-    if (byte_len > UART_MAX_PAYLOAD_LEN) {
-        byte_len = UART_MAX_PAYLOAD_LEN;
+static void on_ecg_received(const ble_conn_context_t *ctx, const int16_t *samples, uint16_t count) {
+    uint8_t sample_bytes = (uint8_t)(count * sizeof(int16_t));
+    if (sample_bytes > 100) {
+        sample_bytes = 100;
     }
-    uart_tx_queue_send(node_id, UART_PKT_TYPE_ECG_BATCH, samples, byte_len);
+
+    uint8_t payload[sizeof(uart_v2_envelope_t) + 100];
+    uart_v2_envelope_t *env = (uart_v2_envelope_t *)payload;
+
+    env->bridge_epoch = uart_tx_bridge_get_active_epoch();
+    env->session_id = ctx->session_id;
+    env->seq = ctx->seq;
+    env->central_rx_mono_ms = ctx->rx_mono_ms;
+
+    memcpy(payload + sizeof(uart_v2_envelope_t), samples, sample_bytes);
+    uart_tx_queue_send(ctx->slot_id, UART_PKT_TYPE_ECG_V2, payload, (uint8_t)(sizeof(uart_v2_envelope_t) + sample_bytes));
 }
 
-static void on_raw_received(uint8_t node_id, const uint8_t *data, uint16_t len) {
-    ARG_UNUSED(node_id);
+static void on_raw_received(const ble_conn_context_t *ctx, const uint8_t *data, uint16_t len) {
+    ARG_UNUSED(ctx);
     ARG_UNUSED(data);
     ARG_UNUSED(len);
 }
@@ -91,17 +135,18 @@ int main(void) {
         gpio_pin_toggle_dt(&user_led);
         led_state = !led_state;
 
+        uart_tx_bridge_poll_handshake();
+
         uart_tx_queue_stats_t q_stats;
         uint32_t q_pending = uart_tx_queue_get_stats(&q_stats);
 
-        LOG_INF("[HEARTBEAT #%03u] Nodes: %u/10 (Sub: %u) | Q: %u/32 (Sent: %u, Drop: %u, Err: %u) | Uptime: %lld ms",
+        LOG_INF("[HEARTBEAT #%03u] Nodes: %u/10 (Sub: %u) | Q: %u/32 (Sent: %u, Drop: %u) | Uptime: %lld ms",
                 heartbeat_cnt++,
                 ble_central_mgr_get_connected_count(),
                 ble_central_mgr_get_subscribed_count(),
                 q_pending,
                 q_stats.sent_count,
                 q_stats.dropped_count,
-                q_stats.error_count,
                 k_uptime_get());
 
         k_msleep(LED_BLINK_INTERVAL_MS);

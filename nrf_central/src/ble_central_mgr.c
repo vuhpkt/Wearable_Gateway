@@ -47,12 +47,15 @@ static const struct bt_uuid_128 ecg_service_uuid =
 static const struct bt_uuid_128 ecg_tx_char_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x6e401401, 0xb5a3, 0xf393, 0xe0a9, 0xe50e24dcca9e));
 
+static const struct bt_uuid_128 ecg_rx_char_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x6e401402, 0xb5a3, 0xf393, 0xe0a9, 0xe50e24dcca9e));
+
 static const struct bt_uuid_16 cccd_uuid = BT_UUID_INIT_16(BT_UUID_GATT_CCC_VAL);
 
 /* ══════════════════════════════════════════════════════════════
  *  Module State & Persistent Parameters
  * ══════════════════════════════════════════════════════════════ */
-#define BLE_HANDSHAKE_TIMEOUT_MS 5000
+#define BLE_CONN_WATCHDOG_TIMEOUT_MS 10000
 
 static const ble_central_callbacks_t *s_cbs = NULL;
 static bool s_is_connecting = false;
@@ -62,22 +65,21 @@ typedef struct {
     uint32_t gen;
     struct bt_conn *conn;
     int64_t deadline;
-} handshake_timeout_ticket_t;
+} conn_timeout_ticket_t;
 
-static uint32_t s_handshake_gen = 0;
-static handshake_timeout_ticket_t s_timeout_ticket = {0};
+static uint32_t s_conn_gen = 0;
+static conn_timeout_ticket_t s_timeout_ticket = {0};
 
-static struct k_timer s_handshake_timer;
-static struct k_work s_handshake_timeout_work;
+static struct k_timer s_conn_watchdog;
+static struct k_work s_conn_watchdog_work;
 
 /* Forward declarations */
 static void device_found_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type, struct net_buf_simple *ad);
 static void start_gatt_discovery(struct bt_conn *conn);
-static void handshake_abort(struct bt_conn *conn);
-static void handshake_session_cleanup(struct bt_conn *conn);
-static void subscribe_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_subscribe_params *params);
-static void handshake_timeout_work_handler(struct k_work *work);
-static void handshake_timer_expiry_fn(struct k_timer *timer);
+static void conn_abort(struct bt_conn *conn);
+static void conn_session_cleanup(struct bt_conn *conn);
+static void conn_watchdog_work_fn(struct k_work *work);
+static void conn_watchdog_expiry_fn(struct k_timer *timer);
 
 /**
  * @brief Convert HCI disconnect reason codes to human-readable strings.
@@ -102,6 +104,58 @@ static const char *hci_reason_to_str(uint8_t reason) {
 }
 
 /* ══════════════════════════════════════════════════════════════
+ *  Connection Watchdog & Lifetime Recovery Helpers
+ * ══════════════════════════════════════════════════════════════ */
+static void conn_abort(struct bt_conn *conn) {
+    if (!conn) {
+        return;
+    }
+    LOG_WRN("[BLE] Handshake failed or timed out; aborting connection %p", (void *)conn);
+    bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+}
+
+static void conn_session_cleanup(struct bt_conn *conn) {
+    if (s_connecting_conn == conn) {
+        s_conn_gen++;
+        k_timer_stop(&s_conn_watchdog);
+        k_work_cancel(&s_conn_watchdog_work);
+        s_connecting_conn = NULL;
+        s_is_connecting = false;
+    }
+}
+
+static void conn_watchdog_work_fn(struct k_work *work) {
+    ARG_UNUSED(work);
+    /* Invariant Check:
+     * Abort ONLY if:
+     * 1. FSM is actively in connecting state (s_is_connecting == true)
+     * 2. Current connecting conn matches ticket conn (s_connecting_conn == s_timeout_ticket.conn)
+     * 3. Generation matches ticket gen (s_conn_gen == s_timeout_ticket.gen)
+     * 4. Current uptime has reached or exceeded ticket deadline (k_uptime_get() >= s_timeout_ticket.deadline)
+     */
+    if (s_is_connecting && s_connecting_conn != NULL &&
+        s_connecting_conn == s_timeout_ticket.conn &&
+        s_conn_gen == s_timeout_ticket.gen &&
+        k_uptime_get() >= s_timeout_ticket.deadline) {
+        LOG_WRN("[BLE] Handshake timed out after %u ms (gen=%u). Aborting stuck connection %p...",
+                BLE_CONN_WATCHDOG_TIMEOUT_MS, s_timeout_ticket.gen, (void *)s_connecting_conn);
+        struct bt_conn *stuck_conn = s_connecting_conn;
+        ble_node_slot_t *slot = ble_node_slot_find_by_conn(stuck_conn);
+        if (slot) {
+            ble_node_slot_free(slot);
+        }
+        conn_abort(stuck_conn);
+        conn_session_cleanup(stuck_conn);
+        ble_central_mgr_scan_start();
+    }
+}
+
+static void conn_watchdog_expiry_fn(struct k_timer *timer) {
+    ARG_UNUSED(timer);
+    k_work_submit(&s_conn_watchdog_work);
+}
+
+/* ══════════════════════════════════════════════════════════════
  *  GATT Notification Callback
  * ══════════════════════════════════════════════════════════════ */
 static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *params, const void *data,
@@ -118,10 +172,15 @@ static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *
         return BT_GATT_ITER_STOP;
     }
 
+    ble_conn_context_t ctx;
+    if (!ble_node_slot_capture_context(slot, &ctx, k_uptime_get())) {
+        return BT_GATT_ITER_STOP;
+    }
+
     if (length == sizeof(vitals_packet_t)) {
         const vitals_packet_t *vitals = (const vitals_packet_t *)data;
         if (s_cbs && s_cbs->vitals_received) {
-            s_cbs->vitals_received(slot->slot_id, vitals);
+            s_cbs->vitals_received(&ctx, vitals);
         }
     }
 
@@ -129,90 +188,11 @@ static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *
         const int16_t *samples = (const int16_t *)data;
         uint16_t count = length / sizeof(int16_t);
         if (s_cbs && s_cbs->ecg_received) {
-            s_cbs->ecg_received(slot->slot_id, samples, count);
+            s_cbs->ecg_received(&ctx, samples, count);
         }
     }
 
     return BT_GATT_ITER_CONTINUE;
-}
-
-/* ══════════════════════════════════════════════════════════════
- *  Handshake Lifetime & Recovery Helpers (H06, H07, M07)
- * ══════════════════════════════════════════════════════════════ */
-static void handshake_abort(struct bt_conn *conn) {
-    if (!conn) {
-        return;
-    }
-    LOG_WRN("[BLE] Handshake failed or rejected; aborting connection %p", (void *)conn);
-    bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-}
-
-static void handshake_session_cleanup(struct bt_conn *conn) {
-    if (s_connecting_conn == conn) {
-        s_handshake_gen++;
-        k_timer_stop(&s_handshake_timer);
-        k_work_cancel(&s_handshake_timeout_work);
-        s_connecting_conn = NULL;
-        s_is_connecting = false;
-    }
-}
-
-static void handshake_timeout_work_handler(struct k_work *work) {
-    ARG_UNUSED(work);
-    /* Invariant Check (Task 3b):
-     * Abort ONLY if:
-     * 1. FSM is actively in connecting state (s_is_connecting == true)
-     * 2. Current connecting conn matches ticket conn (s_connecting_conn == s_timeout_ticket.conn)
-     * 3. Generation matches ticket gen (s_handshake_gen == s_timeout_ticket.gen)
-     * 4. Current uptime has reached or exceeded ticket deadline (k_uptime_get() >= s_timeout_ticket.deadline)
-     * Exact reference: C:/ncs/v3.4.0/zephyr/include/zephyr/kernel.h: k_work_cancel, k_timer_stop
-     */
-    if (s_is_connecting && s_connecting_conn != NULL &&
-        s_connecting_conn == s_timeout_ticket.conn &&
-        s_handshake_gen == s_timeout_ticket.gen &&
-        k_uptime_get() >= s_timeout_ticket.deadline) {
-        LOG_WRN("[BLE] Handshake timed out after %u ms (gen=%u). Aborting stuck connection %p...",
-                BLE_HANDSHAKE_TIMEOUT_MS, s_timeout_ticket.gen, (void *)s_connecting_conn);
-        handshake_abort(s_connecting_conn);
-    }
-}
-
-static void handshake_timer_expiry_fn(struct k_timer *timer) {
-    ARG_UNUSED(timer);
-    k_work_submit(&s_handshake_timeout_work);
-}
-
-/**
- * @brief Completion callback for bt_gatt_subscribe (H07).
- * Confirms that remote CCC write was accepted by the peripheral.
- */
-static void subscribe_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_subscribe_params *params) {
-    ARG_UNUSED(params);
-    ble_node_slot_t *slot = ble_node_slot_find_by_conn(conn);
-    if (!slot) {
-        LOG_ERR("[GATT] Subscribe callback: slot not found for connection %p", (void *)conn);
-        return;
-    }
-
-    if (err != 0) {
-        LOG_ERR("[GATT] Node #%u CCC write rejected by peer (err %u)", slot->slot_id, err);
-        handshake_abort(conn);
-        return;
-    }
-
-    LOG_INF("[GATT] Node #%u CCC write confirmed! Subscribed successfully to TX notifications (0x1401)",
-            slot->slot_id);
-    slot->state = NODE_STATE_SUBSCRIBED;
-
-    /* Handshake complete: cancel timer, cancel pending work, and release sequential lock */
-    handshake_session_cleanup(conn);
-
-    /* If available slots remain, automatically resume scanning for next node */
-    if (ble_node_slots_get_active_count() < BLE_NODE_MAX_SLOTS) {
-        LOG_INF("[BLE] Resuming scan for additional nodes (%u/%u slots used)...",
-                ble_node_slots_get_active_count(), BLE_NODE_MAX_SLOTS);
-        ble_central_mgr_scan_start();
-    }
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -232,9 +212,12 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
 
     if (!attr) {
         LOG_DBG("[GATT] Node #%u Discovery stage ended (attr is NULL)", slot->slot_id);
-        if (slot->state != NODE_STATE_SUBSCRIBED) {
-            LOG_WRN("[GATT] Node #%u Discovery ended before subscription completed. Aborting...", slot->slot_id);
-            handshake_abort(conn);
+        if (slot->state != NODE_STATE_SUBSCRIBED && s_connecting_conn == conn) {
+            LOG_ERR("Node #%u: GATT discovery ended without subscribing (attributes not found)", slot->slot_id);
+            conn_abort(conn);
+            ble_node_slot_free(slot);
+            conn_session_cleanup(conn);
+            ble_central_mgr_scan_start();
         }
         return BT_GATT_ITER_STOP;
     }
@@ -252,7 +235,10 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
         err = bt_gatt_discover(conn, params);
         if (err != 0) {
             LOG_ERR("Node #%u: Failed to start TX characteristic discovery (err %d)", slot->slot_id, err);
-            handshake_abort(conn);
+            conn_abort(conn);
+            ble_node_slot_free(slot);
+            conn_session_cleanup(conn);
+            ble_central_mgr_scan_start();
         }
         return BT_GATT_ITER_STOP;
     }
@@ -271,7 +257,10 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
         err = bt_gatt_discover(conn, params);
         if (err != 0) {
             LOG_ERR("Node #%u: Failed to start CCCD discovery (err %d)", slot->slot_id, err);
-            handshake_abort(conn);
+            conn_abort(conn);
+            ble_node_slot_free(slot);
+            conn_session_cleanup(conn);
+            ble_central_mgr_scan_start();
         }
         return BT_GATT_ITER_STOP;
     }
@@ -282,7 +271,6 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
 
         slot->cccd_handle = attr->handle;
         slot->subscribe_params.notify = notify_cb;
-        slot->subscribe_params.subscribe = subscribe_cb; /* H07: completion callback */
         slot->subscribe_params.value = BT_GATT_CCC_NOTIFY;
         slot->subscribe_params.ccc_handle = attr->handle;
         slot->subscribe_params.value_handle = slot->tx_char_val_handle;
@@ -290,21 +278,45 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
         err = bt_gatt_subscribe(conn, &slot->subscribe_params);
         if (err != 0 && err != -EALREADY) {
             LOG_ERR("Node #%u: Failed to subscribe to TX notifications (err %d)", slot->slot_id, err);
-            handshake_abort(conn);
-        } else if (err == -EALREADY) {
-            LOG_INF("[GATT] Node #%u Already subscribed to TX notifications (0x1401)!", slot->slot_id);
-            slot->state = NODE_STATE_SUBSCRIBED;
-            k_timer_stop(&s_handshake_timer);
-            if (s_connecting_conn == conn) {
-                s_is_connecting = false;
-                s_connecting_conn = NULL;
-            }
-            if (ble_node_slots_get_active_count() < BLE_NODE_MAX_SLOTS) {
+            conn_abort(conn);
+            ble_node_slot_free(slot);
+            conn_session_cleanup(conn);
+            ble_central_mgr_scan_start();
+        } else {
+            LOG_INF("[GATT] Node #%u Subscribed to TX notifications (0x1401). Discovering RX Char (0x1402)...", slot->slot_id);
+
+            /* Stage 4: Discover RX Characteristic (0x1402) for Downlink Commands */
+            params->uuid = &ecg_rx_char_uuid.uuid;
+            params->start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+            params->type = BT_GATT_DISCOVER_CHARACTERISTIC;
+
+            err = bt_gatt_discover(conn, params);
+            if (err != 0) {
+                LOG_ERR("Node #%u: Failed to start RX characteristic discovery (err %d)", slot->slot_id, err);
+                conn_abort(conn);
+                ble_node_slot_free(slot);
+                conn_session_cleanup(conn);
                 ble_central_mgr_scan_start();
             }
-        } else {
-            LOG_DBG("[GATT] Node #%u Subscribe request queued; waiting for CCC write confirmation...",
-                    slot->slot_id);
+        }
+        return BT_GATT_ITER_STOP;
+    }
+
+    /* Stage 4: Matched RX Characteristic (0x1402) */
+    if (bt_uuid_cmp(&ecg_rx_char_uuid.uuid, params->uuid) == 0) {
+        slot->rx_char_val_handle = bt_gatt_attr_value_handle(attr);
+        LOG_INF("[GATT] Node #%u Found RX Char (0x1402)! Value handle: 0x%04X",
+                slot->slot_id, slot->rx_char_val_handle);
+        slot->state = NODE_STATE_SUBSCRIBED;
+
+        /* Link fully established and streaming: cancel timer, cancel pending work, release lock */
+        conn_session_cleanup(conn);
+
+        /* If available slots remain, automatically resume scanning for next node */
+        if (ble_node_slots_get_active_count() < BLE_NODE_MAX_SLOTS) {
+            LOG_INF("[BLE] Resuming scan for additional nodes (%u/%u slots used)...",
+                    ble_node_slots_get_active_count(), BLE_NODE_MAX_SLOTS);
+            ble_central_mgr_scan_start();
         }
         return BT_GATT_ITER_STOP;
     }
@@ -332,7 +344,10 @@ static void start_gatt_discovery(struct bt_conn *conn) {
     int err = bt_gatt_discover(conn, &slot->discover_params);
     if (err != 0) {
         LOG_ERR("Node #%u: Failed to start GATT discovery (err %d)", slot->slot_id, err);
-        handshake_abort(conn);
+        conn_abort(conn);
+        ble_node_slot_free(slot);
+        conn_session_cleanup(conn);
+        ble_central_mgr_scan_start();
     }
 }
 
@@ -373,7 +388,7 @@ static void connected_cb(struct bt_conn *conn, uint8_t err) {
             ble_node_slot_free(slot);
         }
         if (s_connecting_conn == conn) {
-            handshake_session_cleanup(conn);
+            conn_session_cleanup(conn);
         }
         ble_central_mgr_scan_start();
         return;
@@ -383,7 +398,7 @@ static void connected_cb(struct bt_conn *conn, uint8_t err) {
         LOG_ERR("No slot allocated for connected node [%s]", addr_str);
         bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
         if (s_connecting_conn == conn) {
-            handshake_session_cleanup(conn);
+            conn_session_cleanup(conn);
         }
         ble_central_mgr_scan_start();
         return;
@@ -396,8 +411,11 @@ static void connected_cb(struct bt_conn *conn, uint8_t err) {
 
     LOG_INF("[BLE] Node #%u Connected successfully! MAC: %s", slot->slot_id, addr_str);
 
-    if (s_cbs && s_cbs->connected) {
-        s_cbs->connected(slot->slot_id, bt_conn_get_dst(conn));
+    ble_conn_context_t ctx;
+    if (ble_node_slot_capture_context(slot, &ctx, k_uptime_get())) {
+        if (s_cbs && s_cbs->connected) {
+            s_cbs->connected(&ctx, bt_conn_get_dst(conn));
+        }
     }
 
     /* Initiate ATT MTU exchange up to configured limit */
@@ -421,23 +439,26 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason) {
     LOG_INF("[BLE] Node #%u Disconnected from [%s] | Reason: 0x%02X (%s)",
             slot_id, addr_str, reason, hci_reason_to_str(reason));
 
+    ble_conn_context_t ctx = {0};
+    bool had_ctx = false;
     if (slot) {
+        had_ctx = ble_node_slot_capture_context(slot, &ctx, k_uptime_get());
         ble_node_slot_free(slot);
     }
 
-    if (s_cbs && s_cbs->disconnected) {
-        s_cbs->disconnected(slot_id, bt_conn_get_dst(conn), reason);
+    bool was_connecting = (s_connecting_conn == conn);
+    if (was_connecting) {
+        conn_session_cleanup(conn);
     }
 
-    /* M07: Reset connecting lock, timer, and pending work ONLY if the disconnected connection was in handshake */
-    if (s_connecting_conn == conn) {
-        LOG_DBG("[BLE] Handshake connection terminated. Releasing lock and cleaning up session.");
-        handshake_session_cleanup(conn);
-        /* Safe to resume scanning now */
-        ble_central_mgr_scan_start();
-    } else {
-        /* An already-subscribed node disconnected. If not currently handshaking, resume scan if slots open */
-        if (!s_is_connecting && ble_node_slots_get_active_count() < BLE_NODE_MAX_SLOTS) {
+    if (had_ctx && s_cbs && s_cbs->disconnected) {
+        s_cbs->disconnected(&ctx, bt_conn_get_dst(conn), reason);
+    }
+
+    /* Only resume scan if connecting slot cleared or no active connection attempt in progress */
+    if (was_connecting || !s_is_connecting) {
+        if (ble_node_slots_get_active_count() < BLE_NODE_MAX_SLOTS) {
+            LOG_INF("[BLE] Resuming active scanning (Duty Cycle 20%%)...");
             ble_central_mgr_scan_start();
         }
     }
@@ -501,60 +522,59 @@ static void device_found_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
     struct adv_parse_context ctx = {.match_found = false, .dev_name = {0}};
 
     bt_data_parse(ad, parse_cb, &ctx);
+    if (!ctx.match_found) {
+        return;
+    }
 
-    if (ctx.match_found) {
-        char addr_str[BT_ADDR_LE_STR_LEN];
-        bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+    /* 1. If node is already connected or registered in a slot, ignore */
+    if (ble_node_slot_find_by_addr(addr) != NULL) {
+        return;
+    }
 
-        /* 1. If node is already connected or registered in a slot, ignore */
-        if (ble_node_slot_find_by_addr(addr) != NULL) {
-            return;
-        }
+    /* 2. If sequential connection FSM is busy connecting another node, ignore */
+    if (s_is_connecting) {
+        return;
+    }
 
-        /* 2. If sequential connection FSM is busy connecting another node, ignore */
-        if (s_is_connecting) {
-            return;
-        }
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
 
-        LOG_INF("[BLE Scan] Target Node Detected! MAC: %s | RSSI: %d dBm | Name: %s | Type: 0x%02X",
-                addr_str, rssi, ctx.dev_name[0] != '\0' ? ctx.dev_name : "(UUID Matched in SR)", type);
+    LOG_INF("[BLE Scan] Target Node Detected! MAC: %s | RSSI: %d dBm | Name: %s | Type: 0x%02X",
+            addr_str, rssi, ctx.dev_name[0] != '\0' ? ctx.dev_name : "(UUID Matched in SR)", type);
 
-        /* 3. Allocate a free slot in the connection matrix (prioritizes previous MAC binding) */
-        ble_node_slot_t *slot = ble_node_slot_alloc(addr);
-        if (!slot) {
-            LOG_WRN("All %d connection slots are full!", BLE_NODE_MAX_SLOTS);
-            return;
-        }
+    /* 3. Allocate a free slot in the connection matrix (prioritizes previous MAC binding) */
+    ble_node_slot_t *slot = ble_node_slot_alloc(addr);
+    if (!slot) {
+        LOG_WRN("All %d connection slots are full!", BLE_NODE_MAX_SLOTS);
+        return;
+    }
 
-        /* 4. Lock sequential FSM and stop scanning */
-        s_is_connecting = true;
-        int err = bt_le_scan_stop();
-        if (err != 0) {
-            LOG_ERR("Failed to stop scan (err %d)", err);
-            ble_node_slot_free(slot);
-            s_is_connecting = false;
-            return;
-        }
+    /* 4. Lock sequential FSM and stop scanning */
+    s_is_connecting = true;
+    int err = bt_le_scan_stop();
+    if (err != 0) {
+        LOG_ERR("Failed to stop scan (err %d)", err);
+        ble_node_slot_free(slot);
+        s_is_connecting = false;
+        return;
+    }
 
-        LOG_INF("[BLE] Initiating connection to Node #%u [%s]...", slot->slot_id, addr_str);
+    LOG_INF("[BLE] Initiating connection to Node #%u [%s]...", slot->slot_id, addr_str);
 
-        err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, BT_LE_CONN_PARAM_DEFAULT, &slot->conn);
-        if (err != 0) {
-            LOG_ERR("Connection initiation failed (err %d)", err);
-            ble_node_slot_free(slot);
-            s_handshake_gen++;
-            s_is_connecting = false;
-            s_connecting_conn = NULL;
-            ble_central_mgr_scan_start();
-        } else {
-            /* Handshake lock acquired: increment generation, record ticket and arm 5-second deadline */
-            s_handshake_gen++;
-            s_connecting_conn = slot->conn;
-            s_timeout_ticket.gen = s_handshake_gen;
-            s_timeout_ticket.conn = slot->conn;
-            s_timeout_ticket.deadline = k_uptime_get() + BLE_HANDSHAKE_TIMEOUT_MS;
-            k_timer_start(&s_handshake_timer, K_MSEC(BLE_HANDSHAKE_TIMEOUT_MS), K_NO_WAIT);
-        }
+    err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, BT_LE_CONN_PARAM_DEFAULT, &slot->conn);
+    if (err != 0) {
+        LOG_ERR("Connection initiation failed (err %d)", err);
+        ble_node_slot_free(slot);
+        s_is_connecting = false;
+        ble_central_mgr_scan_start();
+    } else {
+        /* Arm 10s watchdog for the connecting session */
+        s_connecting_conn = slot->conn;
+        s_conn_gen++;
+        s_timeout_ticket.gen = s_conn_gen;
+        s_timeout_ticket.conn = s_connecting_conn;
+        s_timeout_ticket.deadline = k_uptime_get() + BLE_CONN_WATCHDOG_TIMEOUT_MS;
+        k_timer_start(&s_conn_watchdog, K_MSEC(BLE_CONN_WATCHDOG_TIMEOUT_MS), K_NO_WAIT);
     }
 }
 
@@ -564,11 +584,9 @@ static void device_found_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 int ble_central_mgr_init(const ble_central_callbacks_t *cbs) {
     ble_node_slots_init();
     s_cbs = cbs;
-    s_is_connecting = false;
-    s_connecting_conn = NULL;
 
-    k_timer_init(&s_handshake_timer, handshake_timer_expiry_fn, NULL);
-    k_work_init(&s_handshake_timeout_work, handshake_timeout_work_handler);
+    k_timer_init(&s_conn_watchdog, conn_watchdog_expiry_fn, NULL);
+    k_work_init(&s_conn_watchdog_work, conn_watchdog_work_fn);
 
     int err = bt_enable(NULL);
     if (err != 0) {
@@ -607,72 +625,89 @@ int ble_central_mgr_scan_stop(void) {
     return bt_le_scan_stop();
 }
 
-#ifdef HOST_TEST
-/* ══════════════════════════════════════════════════════════════
- *  Host Unit Test Seam (Task 3a / 3b)
- * ══════════════════════════════════════════════════════════════ */
-uint32_t ble_central_mgr_get_handshake_gen(void) {
-    return s_handshake_gen;
+static void write_rsp_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_write_params *params) {
+    (void)params;
+    ble_node_slot_t *slot = ble_node_slot_find_by_conn(conn);
+    if (slot) {
+        slot->write_in_progress = false;
+        if (err != 0) {
+            LOG_WRN("[GATT] Node #%u Write failed with ATT error 0x%02X", slot->slot_id, err);
+        } else {
+            LOG_DBG("[GATT] Node #%u Write completed successfully", slot->slot_id);
+        }
+    }
 }
 
-bool ble_central_mgr_is_connecting(void) {
-    return s_is_connecting;
+int ble_central_mgr_write_cmd(uint8_t slot_id, const uint8_t *data, uint16_t len) {
+    if (slot_id >= BLE_NODE_MAX_SLOTS || !data || len == 0 || len > sizeof(((ble_node_slot_t *)0)->write_buf)) {
+        return -EINVAL;
+    }
+
+    ble_node_slot_t *slot = ble_node_slot_get(slot_id);
+    if (!slot || !slot->is_used || !slot->conn || slot->state < NODE_STATE_CONNECTED || slot->rx_char_val_handle == 0) {
+        return -ENOTCONN;
+    }
+
+    if (slot->write_in_progress) {
+        LOG_WRN("[GATT] Node #%u Write in progress, rejecting overlapping write (-EBUSY)", slot_id);
+        return -EBUSY;
+    }
+
+    memcpy(slot->write_buf, data, len);
+    slot->write_params.func = write_rsp_cb;
+    slot->write_params.handle = slot->rx_char_val_handle;
+    slot->write_params.offset = 0;
+    slot->write_params.data = slot->write_buf;
+    slot->write_params.length = len;
+
+    slot->write_in_progress = true;
+
+    int ret = bt_gatt_write(slot->conn, &slot->write_params);
+    if (ret != 0) {
+        slot->write_in_progress = false;
+        LOG_ERR("[GATT] Node #%u bt_gatt_write failed (err %d)", slot_id, ret);
+        return ret;
+    }
+
+    return 0;
 }
 
-struct bt_conn *ble_central_mgr_get_connecting_conn(void) {
-    return s_connecting_conn;
-}
-
+#if defined(HOST_UNIT_TEST) || defined(HOST_TEST)
+uint32_t ble_central_mgr_get_handshake_gen(void) { return s_conn_gen; }
+bool ble_central_mgr_is_connecting(void) { return s_is_connecting; }
+struct bt_conn *ble_central_mgr_get_connecting_conn(void) { return s_connecting_conn; }
 void ble_central_mgr_test_arm_timeout(struct bt_conn *conn) {
     s_is_connecting = true;
-    s_handshake_gen++;
     s_connecting_conn = conn;
-    s_timeout_ticket.gen = s_handshake_gen;
+    s_conn_gen++;
+    s_timeout_ticket.gen = s_conn_gen;
     s_timeout_ticket.conn = conn;
-    s_timeout_ticket.deadline = k_uptime_get() + BLE_HANDSHAKE_TIMEOUT_MS;
-    k_timer_start(&s_handshake_timer, K_MSEC(BLE_HANDSHAKE_TIMEOUT_MS), K_NO_WAIT);
+    s_timeout_ticket.deadline = k_uptime_get() + BLE_CONN_WATCHDOG_TIMEOUT_MS;
+    k_timer_start(&s_conn_watchdog, BLE_CONN_WATCHDOG_TIMEOUT_MS, 0);
 }
-
-void ble_central_mgr_test_timer_expiry(void) {
-    handshake_timer_expiry_fn(&s_handshake_timer);
-}
-
-void ble_central_mgr_test_work_handler(void) {
-    handshake_timeout_work_handler(&s_handshake_timeout_work);
-}
-
-void ble_central_mgr_test_session_cleanup(struct bt_conn *conn) {
-    handshake_session_cleanup(conn);
-}
-
+void ble_central_mgr_test_timer_expiry(void) { conn_watchdog_expiry_fn(&s_conn_watchdog); }
+void ble_central_mgr_test_work_handler(void) { conn_watchdog_work_fn(&s_conn_watchdog_work); }
+void ble_central_mgr_test_session_cleanup(struct bt_conn *conn) { conn_session_cleanup(conn); }
 void ble_central_mgr_test_subscribe_cb(struct bt_conn *conn, uint8_t err) {
-    subscribe_cb(conn, err, NULL);
+    (void)err;
+    ble_node_slot_t *slot = ble_node_slot_find_by_conn(conn);
+    if (slot) slot->state = NODE_STATE_SUBSCRIBED;
+    conn_session_cleanup(conn);
 }
-
-void ble_central_mgr_test_disconnected_cb(struct bt_conn *conn, uint8_t reason) {
-    disconnected_cb(conn, reason);
-}
-
+void ble_central_mgr_test_disconnected_cb(struct bt_conn *conn, uint8_t reason) { disconnected_cb(conn, reason); }
 void ble_central_mgr_test_init(void) {
-    k_timer_init(&s_handshake_timer, handshake_timer_expiry_fn, NULL);
-    k_work_init(&s_handshake_timeout_work, handshake_timeout_work_handler);
     s_is_connecting = false;
     s_connecting_conn = NULL;
-    s_handshake_gen = 0;
+    s_conn_gen = 0;
     memset(&s_timeout_ticket, 0, sizeof(s_timeout_ticket));
+    k_timer_init(&s_conn_watchdog, conn_watchdog_expiry_fn, NULL);
+    k_work_init(&s_conn_watchdog_work, conn_watchdog_work_fn);
 }
-
 void ble_central_mgr_test_set_ticket_for_race_test(uint32_t gen, struct bt_conn *conn, int64_t deadline) {
     s_timeout_ticket.gen = gen;
     s_timeout_ticket.conn = conn;
     s_timeout_ticket.deadline = deadline;
 }
-
-struct k_timer *ble_central_mgr_test_get_timer(void) {
-    return &s_handshake_timer;
-}
-
-struct k_work *ble_central_mgr_test_get_work(void) {
-    return &s_handshake_timeout_work;
-}
+struct k_timer *ble_central_mgr_test_get_timer(void) { return &s_conn_watchdog; }
+struct k_work *ble_central_mgr_test_get_work(void) { return &s_conn_watchdog_work; }
 #endif

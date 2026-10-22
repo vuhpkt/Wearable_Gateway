@@ -12,7 +12,6 @@ target_sources(app PRIVATE
 )
 
 target_include_directories(app PRIVATE
-    include
     src
     ../common
 )
