@@ -27,11 +27,75 @@ extern "C" {
  *  Packet Types
  * ════════════════════════════════════════════════════════════ */
 typedef enum {
-    UART_PKT_TYPE_ECG_BATCH   = 0x01, /* ECG waveform batch (even length 2..128 bytes, 1..64 int16 samples) */
-    UART_PKT_TYPE_VITALS      = 0x02, /* Vitals (5 bytes: hr_ecg, hr_ppg, spo2, temp_x10) */
-    UART_PKT_TYPE_NODE_STATUS = 0x03, /* Connection state report (1 byte: 0=DISC, 1=CONN) */
-    UART_PKT_TYPE_DOWNLINK    = 0x80, /* Downlink command forwarded to node (CMD_*) */
+    UART_PKT_TYPE_ECG_BATCH      = 0x01, /* ECG waveform batch (100 bytes = 50 int16 samples) */
+    UART_PKT_TYPE_VITALS         = 0x02, /* Vitals (5 bytes: hr_ecg, hr_ppg, spo2, temp_x10) */
+    UART_PKT_TYPE_NODE_STATUS    = 0x03, /* Connection state report (1B: 0/1 or 7B: status + MAC) */
+    UART_PKT_TYPE_ECG_V2         = 0x11, /* ECG v2 with session envelope */
+    UART_PKT_TYPE_VITALS_V2      = 0x12, /* Vitals v2 with session envelope */
+    UART_PKT_TYPE_NODE_STATUS_V2 = 0x13, /* Status v2 with session envelope */
+    UART_PKT_TYPE_CONTROL_HELLO  = 0x20, /* Handshake Hello */
+    UART_PKT_TYPE_CONTROL_SYNC   = 0x21, /* Handshake Sync */
+    UART_PKT_TYPE_SNAPSHOT_REQ   = 0x22, /* Request full slot snapshot */
+    UART_PKT_TYPE_SNAPSHOT_END   = 0x23, /* Snapshot burst complete */
+    UART_PKT_TYPE_CONTROL_SYNC_REQ = 0x24, /* Handshake Sync Request initiated by ESP32 */
+    UART_PKT_TYPE_DOWNLINK       = 0x80, /* Downlink command forwarded to node (CMD_*) */
+    UART_PKT_TYPE_DOWNLINK_V2    = 0x90, /* Downlink v2 with session guard */
 } uart_pkt_type_t;
+
+/* ══════════════════════════════════════════════════════════════
+ *  Node Status Packet Structure (7 bytes)
+ * ════════════════════════════════════════════════════════════ */
+#pragma pack(push, 1)
+typedef struct {
+    uint8_t status;     /* 0 = Disconnected, 1 = Connected */
+    uint8_t mac[6];      /* Big-Endian display order (mac[0]=MSB ... mac[5]=LSB) matching LCD */
+} uart_node_status_pkt_t;
+#pragma pack(pop)
+
+/* ══════════════════════════════════════════════════════════════
+ *  Control & Handshake Packet Structures
+ * ════════════════════════════════════════════════════════════ */
+#define UART_BRIDGE_PROTOCOL_VERSION   0x0002U
+
+#pragma pack(push, 1)
+typedef struct {
+    uint16_t version;       /* Protocol version (0x0002) */
+    uint32_t boot_nonce;    /* Central random / boot nonce */
+    uint16_t reserved;      /* 0 */
+} uart_ctrl_hello_pkt_t;
+
+typedef struct {
+    uint16_t version;       /* Negotiated protocol version */
+    uint32_t boot_nonce;    /* Echo Central boot nonce */
+    uint64_t bridge_epoch;  /* ESP32-generated 64-bit epoch */
+    uint8_t  status;        /* 1 = SYNC_OK, 0 = REJECT */
+    uint8_t  reserved;      /* 0 */
+} uart_ctrl_sync_pkt_t;
+
+typedef struct {
+    uint64_t bridge_epoch;    /* Active bridge epoch */
+    uint32_t transaction_id;  /* Monotonic snapshot request ID */
+} uart_snapshot_req_pkt_t;
+
+typedef struct {
+    uint64_t bridge_epoch;    /* Active bridge epoch */
+    uint32_t transaction_id;  /* Echoed snapshot transaction ID */
+    uint8_t  slot_count;      /* Number of slots in snapshot (10) */
+    uint8_t  reserved;        /* 0 */
+} uart_snapshot_end_pkt_t;
+#pragma pack(pop)
+
+/* ══════════════════════════════════════════════════════════════
+ *  v2 Session Guard Envelope (24 bytes)
+ * ════════════════════════════════════════════════════════════ */
+#pragma pack(push, 1)
+typedef struct {
+    uint64_t bridge_epoch;      /* Current active bridge epoch */
+    uint32_t session_id;        /* Active connection session ID (> 0) */
+    uint32_t seq;               /* Monotonically increasing packet sequence */
+    uint64_t central_rx_mono_ms;/* Central monotonic timestamp (ms) */
+} uart_v2_envelope_t;
+#pragma pack(pop)
 
 /* ══════════════════════════════════════════════════════════════
  *  UART Frame Structure

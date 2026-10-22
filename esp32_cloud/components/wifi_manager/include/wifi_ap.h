@@ -38,11 +38,6 @@ void wifi_ap_stop(void);
  */
 bool wifi_ap_is_active(void);
 
-/**
- * @brief Cancel and disarm the SoftAP idle timeout timer.
- */
-void wifi_ap_cancel_timeout(void);
-
 #ifdef __cplusplus
 }
 #endif

@@ -5,7 +5,6 @@
 #include <esp_log.h>
 
 /* Project Local Headers */
-#include "ble_protocol_def.h"
 #include "uart_rx_parser.h"
 
 
@@ -20,25 +19,24 @@ static uint32_t s_valid_frames = 0;
 static uint32_t s_crc_errors = 0;
 
 static inline void handle_sync_error(uint8_t byte) {
-    /* If the unexpected byte is a genuine SOF (0xAA), stay in READ_NODE_ID to resynchronize */
+    /* If the byte is SOF, treat it as the genuine start of a new frame */
     s_state = (byte == UART_FRAME_SOF) ? PARSER_STATE_READ_NODE_ID : PARSER_STATE_WAIT_SOF;
 }
 
-static bool is_valid_payload_len(uint8_t pkt_type, uint8_t len) {
-    if (len == 0 || len > UART_MAX_PAYLOAD_LEN) {
-        return false;
-    }
-    switch (pkt_type) {
-    case UART_PKT_TYPE_ECG_BATCH:
-        /* ECG batch payload must be an even byte length (1..64 int16 samples) */
-        return (len >= sizeof(int16_t)) && ((len % sizeof(int16_t)) == 0);
-    case UART_PKT_TYPE_VITALS:
-        return (len == sizeof(vitals_packet_t)); /* 5 bytes */
-    case UART_PKT_TYPE_NODE_STATUS:
-        return (len == 1);
-    default:
-        return true;
-    }
+static inline bool is_valid_pkt_type(uint8_t type) {
+    return (type == UART_PKT_TYPE_ECG_BATCH ||
+            type == UART_PKT_TYPE_VITALS ||
+            type == UART_PKT_TYPE_NODE_STATUS ||
+            type == UART_PKT_TYPE_ECG_V2 ||
+            type == UART_PKT_TYPE_VITALS_V2 ||
+            type == UART_PKT_TYPE_NODE_STATUS_V2 ||
+            type == UART_PKT_TYPE_CONTROL_HELLO ||
+            type == UART_PKT_TYPE_CONTROL_SYNC ||
+            type == UART_PKT_TYPE_SNAPSHOT_REQ ||
+            type == UART_PKT_TYPE_SNAPSHOT_END ||
+            type == UART_PKT_TYPE_CONTROL_SYNC_REQ ||
+            type == UART_PKT_TYPE_DOWNLINK ||
+            type == UART_PKT_TYPE_DOWNLINK_V2);
 }
 
 static void parse_byte(uint8_t byte) {
@@ -60,10 +58,7 @@ static void parse_byte(uint8_t byte) {
             break;
 
         case PARSER_STATE_READ_PKT_TYPE:
-            if (byte == UART_PKT_TYPE_ECG_BATCH || 
-                byte == UART_PKT_TYPE_VITALS || 
-                byte == UART_PKT_TYPE_NODE_STATUS || 
-                byte == UART_PKT_TYPE_DOWNLINK) {
+            if (is_valid_pkt_type(byte)) {
                 s_current_frame.pkt_type = byte;
                 s_crc_buffer[1] = byte;
                 s_state = PARSER_STATE_READ_LEN;
@@ -73,7 +68,7 @@ static void parse_byte(uint8_t byte) {
             break;  
 
         case PARSER_STATE_READ_LEN:
-            if (is_valid_payload_len(s_current_frame.pkt_type, byte)) {
+            if (byte > 0 && byte <= UART_MAX_PAYLOAD_LEN) {
                 s_current_frame.len = byte;
                 s_crc_buffer[2] = byte;
                 s_payload_idx = 0;

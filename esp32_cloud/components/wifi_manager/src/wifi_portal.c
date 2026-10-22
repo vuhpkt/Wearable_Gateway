@@ -9,23 +9,17 @@
 #include <stdio.h>
 #include <string.h>
 
-#ifdef HOST_TEST
-#include "gateway_host_port.h"
-#else
 #include "esp_err.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#endif
 
-#include "wifi_ap.h"
 #include "wifi_portal.h"
 
 static const char *TAG = "WIFI_PORTAL";
 static httpd_handle_t s_server = NULL;
 static wifi_portal_new_creds_cb_t s_creds_cb = NULL;
-static volatile bool s_transition_in_progress = false;
 
 static const char PORTAL_HTML[] =
 "<!DOCTYPE html>"
@@ -76,172 +70,60 @@ static void url_decode(char *dst, size_t dst_size, const char *src) {
     dst[i] = '\0';
 }
 
-/* [M2 FIX] Strict query parameter extractor matching exact key names */
-static bool get_query_param(const char *body, const char *key, char *out_val, size_t out_val_size) {
-    if (!body || !key || !out_val || out_val_size == 0) return false;
-
-    size_t key_len = strlen(key);
-    const char *p = body;
-
-    while (*p) {
-        bool key_start = (p == body) || (*(p - 1) == '&');
-        if (key_start && strncmp(p, key, key_len) == 0 && p[key_len] == '=') {
-            const char *val_start = p + key_len + 1;
-            const char *val_end = strchr(val_start, '&');
-            size_t val_len = val_end ? (size_t)(val_end - val_start) : strlen(val_start);
-
-            if (val_len >= out_val_size) {
-                val_len = out_val_size - 1;
-            }
-            memcpy(out_val, val_start, val_len);
-            out_val[val_len] = '\0';
-            return true;
-        }
-        p++;
-    }
-    return false;
-}
-
-#define PROV_TRANS_TASK_STACK_SIZE 3072
-static StaticTask_t s_prov_task_tcb;
-static StackType_t s_prov_task_stack[PROV_TRANS_TASK_STACK_SIZE / sizeof(StackType_t)];
-static TaskHandle_t s_prov_task_handle = NULL;
-
-typedef struct {
-    char ssid[33];
-    char pass[65];
-    bool pending;
-} prov_mailbox_t;
-
-static prov_mailbox_t s_prov_mailbox = {0};
-static portMUX_TYPE s_prov_lock = portMUX_INITIALIZER_UNLOCKED;
-
-static void prov_worker_task(void *pvParameters) {
-    (void)pvParameters;
-    while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        char local_ssid[33] = {0};
-        char local_pass[65] = {0};
-        bool has_creds = false;
-
-        portENTER_CRITICAL(&s_prov_lock);
-        if (s_prov_mailbox.pending) {
-            strncpy(local_ssid, s_prov_mailbox.ssid, sizeof(local_ssid) - 1);
-            strncpy(local_pass, s_prov_mailbox.pass, sizeof(local_pass) - 1);
-            /* Zero out sensitive credentials in mailbox immediately */
-            memset(&s_prov_mailbox, 0, sizeof(s_prov_mailbox));
-            has_creds = true;
-        }
-        portEXIT_CRITICAL(&s_prov_lock);
-
-        if (has_creds) {
-            /* Delay to allow HTTP response to flush over TCP before shutting down AP */
-            vTaskDelay(pdMS_TO_TICKS(1000));
-
-            if (s_creds_cb != NULL) {
-                s_creds_cb(local_ssid, local_pass);
-            }
-
-            /* Zero out local sensitive credentials */
-            memset(local_ssid, 0, sizeof(local_ssid));
-            memset(local_pass, 0, sizeof(local_pass));
-
-            portENTER_CRITICAL(&s_prov_lock);
-            s_transition_in_progress = false;
-            portEXIT_CRITICAL(&s_prov_lock);
-        }
-    }
-}
-
 static esp_err_t get_index_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_send(req, PORTAL_HTML, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
+static bool extract_url_encoded_param(const char *buf, const char *key, char *out, size_t out_size) {
+    if (!buf || !key || !out || out_size == 0) return false;
+
+    const char *pos = strstr(buf, key);
+    if (!pos) return false;
+
+    pos += strlen(key);
+    const char *end = strchr(pos, '&');
+    size_t len = end ? (size_t)(end - pos) : strlen(pos);
+    if (len >= out_size) len = out_size - 1;
+
+    strncpy(out, pos, len);
+    out[len] = '\0';
+    return true;
+}
+
 static esp_err_t post_save_handler(httpd_req_t *req) {
-    /* [H4 FIX] Guard against duplicate clicks spawning competing transition tasks */
-    if (s_transition_in_progress) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Provisioning already in progress");
+    char buf[256] = {0};
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
         return ESP_FAIL;
     }
-
-    /* [H3 FIX] Validate content length and handle fragmented TCP receive */
-    int total_len = req->content_len;
-    if (total_len <= 0 || total_len >= 512) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
-        return ESP_FAIL;
-    }
-
-    char buf[512] = {0};
-    int cur_offset = 0;
-    int timeout_retries = 0;
-    while (cur_offset < total_len) {
-        int received = httpd_req_recv(req, buf + cur_offset, total_len - cur_offset);
-        if (received <= 0) {
-            if (received == HTTPD_SOCK_ERR_TIMEOUT) {
-                timeout_retries++;
-                if (timeout_retries < 3) {
-                    continue;
-                }
-            }
-            s_transition_in_progress = false;
-            httpd_resp_send_408(req);
-            return ESP_FAIL;
-        }
-        cur_offset += received;
-    }
-    buf[total_len] = '\0';
 
     char raw_ssid[128] = {0};
     char raw_pass[128] = {0};
     char ssid[33] = {0};
     char pass[65] = {0};
 
-    bool has_ssid = get_query_param(buf, "ssid", raw_ssid, sizeof(raw_ssid));
-    bool has_pass = get_query_param(buf, "pass", raw_pass, sizeof(raw_pass));
-
-    if (has_ssid && has_pass) {
+    if (extract_url_encoded_param(buf, "ssid=", raw_ssid, sizeof(raw_ssid)) &&
+        extract_url_encoded_param(buf, "pass=", raw_pass, sizeof(raw_pass))) {
         url_decode(ssid, sizeof(ssid), raw_ssid);
         url_decode(pass, sizeof(pass), raw_pass);
 
-        if (strlen(ssid) == 0) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID cannot be empty");
-            return ESP_FAIL;
-        }
-
         ESP_LOGI(TAG, "Received new credentials via Web Portal: SSID='%s'", ssid);
 
-        /* [M9 FIX] Disarm SoftAP idle timeout immediately upon valid credential submission */
-        wifi_ap_cancel_timeout();
-
-        /* [H12 FIX] Fixed static HTML response prevents Reflected XSS (CWE-79) */
-        static const char SUCCESS_HTML[] =
-            "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'><title>Saved</title>"
-            "<style>body{font-family:sans-serif;text-align:center;padding:40px;background:#0f172a;color:#fff;}h2{color:#4ade80;}</style></head>"
-            "<body><h2>Credentials Saved!</h2><p>Connecting to Wi-Fi network...</p><p>You may reconnect to your home Wi-Fi.</p></body></html>";
-
-        /* Latch credentials into static resident worker mailbox */
-        portENTER_CRITICAL(&s_prov_lock);
-        if (s_transition_in_progress || s_prov_mailbox.pending) {
-            portEXIT_CRITICAL(&s_prov_lock);
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Provisioning already in progress");
-            return ESP_FAIL;
-        }
-        s_transition_in_progress = true;
-        s_prov_mailbox.pending = true;
-        strncpy(s_prov_mailbox.ssid, ssid, sizeof(s_prov_mailbox.ssid) - 1);
-        s_prov_mailbox.ssid[sizeof(s_prov_mailbox.ssid) - 1] = '\0';
-        strncpy(s_prov_mailbox.pass, pass, sizeof(s_prov_mailbox.pass) - 1);
-        s_prov_mailbox.pass[sizeof(s_prov_mailbox.pass) - 1] = '\0';
-        portEXIT_CRITICAL(&s_prov_lock);
-
+        /* Send Success HTML Response */
+        char resp[512];
+        snprintf(resp, sizeof(resp),
+                 "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'><title>Saved</title>"
+                 "<style>body{font-family:sans-serif;text-align:center;padding:40px;background:#0f172a;color:#fff;}h2{color:#4ade80;}</style></head>"
+                 "<body><h2>Credentials Saved!</h2><p>Connecting to <b>%s</b>...</p><p>You may reconnect to your home Wi-Fi.</p></body></html>",
+                 ssid);
         httpd_resp_set_type(req, "text/html; charset=utf-8");
-        httpd_resp_send(req, SUCCESS_HTML, HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
 
-        if (s_prov_task_handle != NULL) {
-            xTaskNotifyGive(s_prov_task_handle);
+        if (s_creds_cb != NULL) {
+            s_creds_cb(ssid, pass);
         }
 
         return ESP_OK;
@@ -256,29 +138,7 @@ esp_err_t wifi_portal_start(wifi_portal_new_creds_cb_t on_creds_received) {
         return ESP_OK; /* Already running */
     }
 
-    portENTER_CRITICAL(&s_prov_lock);
-    s_transition_in_progress = false;
-    memset(&s_prov_mailbox, 0, sizeof(s_prov_mailbox));
-    portEXIT_CRITICAL(&s_prov_lock);
     s_creds_cb = on_creds_received;
-
-    /* Ensure resident static worker is running */
-    if (s_prov_task_handle == NULL) {
-        s_prov_task_handle = xTaskCreateStaticPinnedToCore(
-            prov_worker_task,
-            "prov_trans_tsk",
-            PROV_TRANS_TASK_STACK_SIZE,
-            NULL,
-            3,
-            s_prov_task_stack,
-            &s_prov_task_tcb,
-            0  /* Core 0 */
-        );
-        if (s_prov_task_handle == NULL) {
-            ESP_LOGE(TAG, "Failed to create static prov_trans_tsk");
-            return ESP_FAIL;
-        }
-    }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 8;
@@ -314,81 +174,6 @@ void wifi_portal_stop(void) {
     if (s_server != NULL) {
         httpd_stop(s_server);
         s_server = NULL;
-        portENTER_CRITICAL(&s_prov_lock);
-        s_transition_in_progress = false;
-        memset(&s_prov_mailbox, 0, sizeof(s_prov_mailbox));
-        portEXIT_CRITICAL(&s_prov_lock);
         ESP_LOGI(TAG, "Web Portal stopped.");
     }
 }
-
-#ifdef HOST_TEST
-/* Host test seam for Task 5b verification */
-bool wifi_portal_test_is_busy(void) {
-    portENTER_CRITICAL(&s_prov_lock);
-    bool busy = s_transition_in_progress || s_prov_mailbox.pending;
-    portEXIT_CRITICAL(&s_prov_lock);
-    return busy;
-}
-
-bool wifi_portal_test_mailbox_has_creds(char *out_ssid, size_t ssid_len, char *out_pass, size_t pass_len) {
-    portENTER_CRITICAL(&s_prov_lock);
-    bool pending = s_prov_mailbox.pending;
-    if (pending) {
-        if (out_ssid && ssid_len > 0) {
-            strncpy(out_ssid, s_prov_mailbox.ssid, ssid_len - 1);
-            out_ssid[ssid_len - 1] = '\0';
-        }
-        if (out_pass && pass_len > 0) {
-            strncpy(out_pass, s_prov_mailbox.pass, pass_len - 1);
-            out_pass[pass_len - 1] = '\0';
-        }
-    }
-    portEXIT_CRITICAL(&s_prov_lock);
-    return pending;
-}
-
-void wifi_portal_test_step_worker(void) {
-    char local_ssid[33] = {0};
-    char local_pass[65] = {0};
-    bool has_creds = false;
-
-    portENTER_CRITICAL(&s_prov_lock);
-    if (s_prov_mailbox.pending) {
-        strncpy(local_ssid, s_prov_mailbox.ssid, sizeof(local_ssid) - 1);
-        strncpy(local_pass, s_prov_mailbox.pass, sizeof(local_pass) - 1);
-        memset(&s_prov_mailbox, 0, sizeof(s_prov_mailbox));
-        has_creds = true;
-    }
-    portEXIT_CRITICAL(&s_prov_lock);
-
-    if (has_creds) {
-        if (s_creds_cb != NULL) {
-            s_creds_cb(local_ssid, local_pass);
-        }
-        memset(local_ssid, 0, sizeof(local_ssid));
-        memset(local_pass, 0, sizeof(local_pass));
-
-        portENTER_CRITICAL(&s_prov_lock);
-        s_transition_in_progress = false;
-        portEXIT_CRITICAL(&s_prov_lock);
-    }
-}
-
-esp_err_t wifi_portal_test_post_save(httpd_req_t *req) {
-    return post_save_handler(req);
-}
-
-TaskHandle_t wifi_portal_test_get_worker_handle(void) {
-    return s_prov_task_handle;
-}
-
-void wifi_portal_test_reset(void) {
-    portENTER_CRITICAL(&s_prov_lock);
-    s_transition_in_progress = false;
-    memset(&s_prov_mailbox, 0, sizeof(s_prov_mailbox));
-    portEXIT_CRITICAL(&s_prov_lock);
-    s_server = NULL;
-    s_creds_cb = NULL;
-}
-#endif

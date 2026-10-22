@@ -3,6 +3,7 @@
 /* Standard C Libraries */
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/time.h>
 
 /* FreeRTOS & ESP-IDF System Headers */
 #include <esp_err.h>
@@ -20,12 +21,15 @@ esp_err_t wifi_sta_wait_connected(TickType_t timeout_ticks);
 /* SNTP Real-Time Clock Synchronization */
 bool wifi_sta_is_time_synced(void);
 esp_err_t wifi_sta_wait_time_sync(uint32_t timeout_ms);
+typedef void (*wifi_sta_sntp_cb_t)(struct timeval *tv);
+void wifi_sta_set_sntp_cb(wifi_sta_sntp_cb_t cb);
+
+/* Callback fired when Wi-Fi IP is assigned */
+typedef void (*wifi_sta_got_ip_cb_t)(void);
+void wifi_sta_set_got_ip_cb(wifi_sta_got_ip_cb_t cb);
 
 /* Algorithmic Exponential Backoff Calculator (Tested on Host) */
 uint32_t wifi_calculate_backoff_sec(uint32_t retry_count);
 
 /* RF Diagnostic Tool: Scan 2.4GHz APs and log RSSI/Channel/SSID */
 void wifi_scan_and_log_aps(void);
-
-/* Power Save Diagnostic */
-esp_err_t wifi_sta_get_power_save(int *out_ps_mode);

@@ -69,43 +69,21 @@ esp_err_t wifi_ap_start(const char *ssid, const char *password) {
     }
 
     wifi_config_t wifi_ap_config = {0};
-    size_t in_ssid_len = strlen(ssid);
-    if (in_ssid_len > sizeof(wifi_ap_config.ap.ssid)) {
-        in_ssid_len = sizeof(wifi_ap_config.ap.ssid);
-    }
-    memcpy(wifi_ap_config.ap.ssid, ssid, in_ssid_len);
-    wifi_ap_config.ap.ssid_len = (uint8_t)in_ssid_len;
+    strncpy((char *)wifi_ap_config.ap.ssid, ssid, sizeof(wifi_ap_config.ap.ssid) - 1);
+    wifi_ap_config.ap.ssid_len = strlen(ssid);
     wifi_ap_config.ap.channel = 1;
     wifi_ap_config.ap.max_connection = 4;
 
-    /* [H11 FIX] Passwords < 8 chars must be rejected with error, not silently downgraded to OPEN */
-    if (password && strlen(password) > 0) {
-        if (strlen(password) < 8) {
-            ESP_LOGE(TAG, "SoftAP password must be at least 8 characters (WPA2 requirement)!");
-            return ESP_ERR_INVALID_ARG;
-        }
+    if (password && strlen(password) >= 8) {
         strncpy((char *)wifi_ap_config.ap.password, password, sizeof(wifi_ap_config.ap.password) - 1);
         wifi_ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
     } else {
         wifi_ap_config.ap.authmode = WIFI_AUTH_OPEN;
     }
 
-    /* [H9 FIX] Graceful error checking in runtime without ESP_ERROR_CHECK panic reboots */
-    esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_AP);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_set_mode AP failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ret = esp_wifi_set_config(WIFI_IF_AP, &wifi_ap_config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_set_config AP failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ret = esp_wifi_start();
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "esp_wifi_start AP failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_ap_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
 
     s_ap_active = true;
 
@@ -118,13 +96,11 @@ esp_err_t wifi_ap_start(const char *ssid, const char *password) {
                 .dispatch_method = ESP_TIMER_TASK,
                 .name = "softap_timeout_tmr"
             };
-            esp_timer_create(&timer_args, &s_ap_timeout_timer);
+            ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_ap_timeout_timer));
         }
-        if (s_ap_timeout_timer != NULL) {
-            esp_timer_stop(s_ap_timeout_timer);
-            esp_timer_start_once(s_ap_timeout_timer, (uint64_t)s_timeout_sec * 1000000ULL);
-            ESP_LOGI(TAG, "⏱ SoftAP Idle Timeout armed: %lu seconds (auto-shutdown if inactive)", (unsigned long)s_timeout_sec);
-        }
+        esp_timer_stop(s_ap_timeout_timer);
+        ESP_ERROR_CHECK(esp_timer_start_once(s_ap_timeout_timer, (uint64_t)s_timeout_sec * 1000000ULL));
+        ESP_LOGI(TAG, "⏱ SoftAP Idle Timeout armed: %lu seconds (auto-shutdown if inactive)", (unsigned long)s_timeout_sec);
     }
 
     ESP_LOGI(TAG, "===============================================================");
@@ -133,13 +109,6 @@ esp_err_t wifi_ap_start(const char *ssid, const char *password) {
     ESP_LOGI(TAG, "    IP:   192.168.4.1 (Web Server ready)");
     ESP_LOGI(TAG, "===============================================================");
     return ESP_OK;
-}
-
-void wifi_ap_cancel_timeout(void) {
-    if (s_ap_timeout_timer != NULL) {
-        esp_timer_stop(s_ap_timeout_timer);
-        ESP_LOGI(TAG, "SoftAP Idle Timeout cancelled.");
-    }
 }
 
 void wifi_ap_stop(void) {

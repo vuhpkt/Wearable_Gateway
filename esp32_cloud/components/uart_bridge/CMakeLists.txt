@@ -1,5 +1,19 @@
 idf_component_register(
-    SRCS "src/uart_bridge_rx.c" "src/uart_rx_parser.c"
-    INCLUDE_DIRS "include"
-    REQUIRES common esp_common esp_driver_uart log
+    SRCS
+        "src/uart_bridge.c"
+        "src/uart_bridge_rx.c"
+        "src/uart_rx_parser.c"
+        "src/core1_gate.c"
+        "src/frame_snapshot.c"
+        "src/gateway_ingest.c"
+        "src/gateway_time.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        common
+        esp_driver_uart
+        esp_driver_gpio
+        esp_timer
+        freertos
+        log
 )

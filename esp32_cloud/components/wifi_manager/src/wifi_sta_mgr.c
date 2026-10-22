@@ -22,7 +22,6 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
-#include "esp_sntp.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -30,9 +29,14 @@
 
 #include "wifi_config.h"
 #include "wifi_sta_mgr.h"
-#include "thingsboard_mqtt.h"
 
 static const char *TAG = "wifi_sta";
+
+static wifi_sta_got_ip_cb_t s_got_ip_cb = NULL;
+
+void wifi_sta_set_got_ip_cb(wifi_sta_got_ip_cb_t cb) {
+    s_got_ip_cb = cb;
+}
 
 static esp_netif_t *s_netif_sta = NULL;
 static volatile bool s_is_connected = false;
@@ -45,6 +49,21 @@ static char s_current_pass[65] = {0};
 static esp_timer_handle_t s_reconnect_timer = NULL;
 static esp_timer_handle_t s_sntp_resync_timer = NULL;
 static bool s_handlers_registered = false;
+static wifi_sta_sntp_cb_t s_sntp_cb = NULL;
+
+void wifi_sta_set_sntp_cb(wifi_sta_sntp_cb_t cb) {
+    s_sntp_cb = cb;
+}
+
+static void sntp_sync_notification_cb(struct timeval *tv) {
+    if (tv) {
+        ESP_LOGI(TAG, "⏰ [SNTP] Real-time synchronized: sec=%lld, usec=%ld",
+                 (long long)tv->tv_sec, (long)tv->tv_usec);
+        if (s_sntp_cb != NULL) {
+            s_sntp_cb(tv);
+        }
+    }
+}
 
 uint32_t wifi_calculate_backoff_sec(uint32_t retry_count) {
     if (retry_count == 0) return 2;
@@ -59,14 +78,10 @@ static void on_reconnect_timer(void *arg) {
     if (s_sta_stopped) {
         return;
     }
-    if (!s_is_connected) {
+    if (!s_is_connected && !s_connect_failed) {
         ESP_LOGI(TAG, "Retrying Wi-Fi connection: '%s' (Attempt #%lu)...",
                  s_current_ssid, (unsigned long)s_retry_count + 1);
-        esp_err_t err = esp_wifi_connect();
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "esp_wifi_connect() failed: %s (0x%x). Rearming retry timer.", esp_err_to_name(err), err);
-            esp_timer_start_once(s_reconnect_timer, 2000000ULL);
-        }
+        esp_wifi_connect();
     }
 }
 
@@ -103,12 +118,7 @@ void wifi_scan_and_log_aps(void) {
     if (ap_count > 0) {
         wifi_ap_record_t ap_records[8]; /* Stack allocation: auto-freed, no .bss overhead */
         uint16_t retrieve_count = (ap_count > 8) ? 8 : ap_count;
-        esp_err_t rec_err = esp_wifi_scan_get_ap_records(&retrieve_count, ap_records);
-        if (rec_err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to get scan records: %s. Clearing scan list.", esp_err_to_name(rec_err));
-            esp_wifi_clear_ap_list();
-            return;
-        }
+        esp_wifi_scan_get_ap_records(&retrieve_count, ap_records);
         ESP_LOGI(TAG, "🔍 [SCAN RESULTS] Found %u 2.4GHz Wi-Fi APs (displaying %u):", ap_count, retrieve_count);
         bool found_target = false;
         for (int i = 0; i < retrieve_count; i++) {
@@ -136,15 +146,6 @@ void wifi_scan_and_log_aps(void) {
     }
 }
 
-static void sntp_sync_notification_cb(struct timeval *tv) {
-    time_t now = tv ? tv->tv_sec : time(NULL);
-    struct tm timeinfo;
-    localtime_r(&now, &timeinfo);
-    char strftime_buf[64];
-    strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
-    ESP_LOGI(TAG, "⏰ [SNTP] Time synchronized! Current RTC: %s (epoch=%lld)", strftime_buf, (long long)now);
-}
-
 static void on_sntp_resync_timer(void *arg) {
     (void)arg;
     if (s_is_connected) {
@@ -168,33 +169,24 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             return;
         }
 
+        s_retry_count++;
+        /* 
+         * IMPORTANT:
+         * Do NOT invoke esp_wifi_disconnect() here.
+         * Driver v6.0.2 is already in disconnected state; invoking disconnect triggers Reason 36.
+         */
         wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
         uint8_t reason = disconn ? disconn->reason : 0;
 
-        /* [L1 FIX] Calculate backoff for current attempt BEFORE incrementing retry count */
         uint32_t backoff_sec = wifi_calculate_backoff_sec(s_retry_count);
-        s_retry_count++;
-        if (s_retry_count >= CONFIG_WIFI_MAX_RETRY) {
-            s_connect_failed = true;
-            ESP_LOGW(TAG, "⚠️ Wi-Fi disconnected (Attempt #%lu >= %d threshold). Continuing 30s background retry...",
-                     (unsigned long)s_retry_count, CONFIG_WIFI_MAX_RETRY);
-        } else {
-            ESP_LOGW(TAG, "Wi-Fi disconnected (Reason: %u, Attempt #%lu). Retrying in %lu seconds...",
-                     reason, (unsigned long)s_retry_count, (unsigned long)backoff_sec);
-        }
+        ESP_LOGW(TAG, "Wi-Fi disconnected (Reason: %u, Attempt #%lu). Retrying in %lu seconds...",
+                 reason, (unsigned long)s_retry_count, (unsigned long)backoff_sec);
 
-        /* [H05 FIX] Always arm reconnect timer (never give up in 24/7 gateway) */
-        if (s_reconnect_timer != NULL && !s_sta_stopped) {
+        if (s_reconnect_timer != NULL) {
             esp_timer_stop(s_reconnect_timer);
             esp_timer_start_once(s_reconnect_timer, (uint64_t)backoff_sec * 1000000ULL);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        /* [H6 FIX] If Station was stopped intentionally, ignore queued in-flight GOT_IP events */
-        if (s_sta_stopped) {
-            ESP_LOGI(TAG, "IP_EVENT_STA_GOT_IP received but Station is stopped. Ignoring.");
-            return;
-        }
-
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "===============================================================");
         ESP_LOGI(TAG, ">>> WI-FI CONNECTED & IP ASSIGNED SUCCESSFULLY! <<<");
@@ -212,49 +204,31 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         s_is_connected = true;
         s_has_connected_once = true;
 
-        /* Resume MQTT client if it was paused during SoftAP provisioning */
-        tb_mqtt_resume();
+        /* Notify registered callback (e.g. to resume MQTT client) */
+        if (s_got_ip_cb != NULL) {
+            s_got_ip_cb();
+        }
 
         static bool s_sntp_initialized = false;
         if (!s_sntp_initialized) {
-#if CONFIG_LWIP_SNTP_MAX_SERVERS >= 3
-            esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
-                3,
-                ESP_SNTP_SERVER_LIST("time.google.com", "time.cloudflare.com", "pool.ntp.org")
-            );
-#else
-            esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("time.google.com");
-#endif
+            esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
             sntp_config.sync_cb = sntp_sync_notification_cb;
-            sntp_config.server_from_dhcp = false;
-            sntp_config.renew_servers_after_new_IP = true;
+            esp_netif_sntp_init(&sntp_config);
+            s_sntp_initialized = true;
+            ESP_LOGI(TAG, "⏰ [SNTP] Real-time clock synchronization started via pool.ntp.org");
 
-            esp_err_t sntp_err = esp_netif_sntp_init(&sntp_config);
-            if (sntp_err == ESP_OK) {
-                s_sntp_initialized = true;
-                ESP_LOGI(TAG, "⏰ [SNTP] Real-time clock synchronization started (time.google.com / time.cloudflare.com / pool.ntp.org)");
-
-                if (s_sntp_resync_timer == NULL) {
-                    esp_timer_create_args_t tmr_args = {
-                        .callback = on_sntp_resync_timer,
-                        .arg = NULL,
-                        .dispatch_method = ESP_TIMER_TASK,
-                        .name = "sntp_resync_tmr"
-                    };
-                    if (esp_timer_create(&tmr_args, &s_sntp_resync_timer) == ESP_OK) {
-                        esp_timer_start_periodic(s_sntp_resync_timer, 3600ULL * 1000000ULL);
-                    }
+            if (s_sntp_resync_timer == NULL) {
+                esp_timer_create_args_t tmr_args = {
+                    .callback = on_sntp_resync_timer,
+                    .arg = NULL,
+                    .dispatch_method = ESP_TIMER_TASK,
+                    .name = "sntp_resync_tmr"
+                };
+                if (esp_timer_create(&tmr_args, &s_sntp_resync_timer) == ESP_OK) {
+                    esp_timer_start_periodic(s_sntp_resync_timer, 3600ULL * 1000000ULL);
                 }
-            } else {
-                ESP_LOGE(TAG, "Failed to initialize SNTP: %s", esp_err_to_name(sntp_err));
             }
-        } else {
-            esp_netif_sntp_start();
         }
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
-        /* [H8 FIX] L3 IP lease expired or revoked. Mark disconnected immediately */
-        ESP_LOGW(TAG, "⚠️ Lost IP address lease (IP_EVENT_STA_LOST_IP). Marking L3 disconnected.");
-        s_is_connected = false;
     }
 }
 
@@ -300,23 +274,14 @@ esp_err_t wifi_sta_init_with_creds(const char *ssid, const char *password) {
     if (!s_handlers_registered) {
         esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
         esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
-        esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_LOST_IP, &wifi_event_handler, NULL, NULL);
         s_handlers_registered = true;
     }
 
-    /* [H2 FIX] Full-length SSID (32 bytes) and WPA2 PSK (64 hex characters) support per IEEE 802.11 */
     wifi_config_t wifi_config = { 0 };
-    size_t ssid_len = strlen(s_current_ssid);
-    if (ssid_len > sizeof(wifi_config.sta.ssid)) {
-        ssid_len = sizeof(wifi_config.sta.ssid);
+    strncpy((char *)wifi_config.sta.ssid, s_current_ssid, sizeof(wifi_config.sta.ssid) - 1);
+    if (strlen(s_current_pass) > 0) {
+        strncpy((char *)wifi_config.sta.password, s_current_pass, sizeof(wifi_config.sta.password) - 1);
     }
-    memcpy(wifi_config.sta.ssid, s_current_ssid, ssid_len);
-
-    size_t pass_len = strlen(s_current_pass);
-    if (pass_len > sizeof(wifi_config.sta.password)) {
-        pass_len = sizeof(wifi_config.sta.password);
-    }
-    memcpy(wifi_config.sta.password, s_current_pass, pass_len);
 
     /* 
      * IEEE 802.11 Dynamic Channel Discovery:
@@ -342,40 +307,19 @@ esp_err_t wifi_sta_init_with_creds(const char *ssid, const char *password) {
     };
     esp_wifi_set_country(&country);
 
-    /* [H9 FIX] Graceful error checking in runtime without ESP_ERROR_CHECK panic reboots */
-    esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_STA);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_set_mode failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ret = esp_wifi_start();
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
     /* Level 1 Power Optimization: Enable minimum modem sleep to shut off RF/PHY between DTIM beacons */
-    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-    if (ps_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set Wi-Fi power save mode: %s", esp_err_to_name(ps_err));
-    }
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW20);
 
-    /* Limit TX power to 17 dBm (input 68 quantized to 66 in IDF v6.0.2) to prevent close-range distortion */
+    /* Limit TX power to 17 dBm (68 * 0.25 dBm) to prevent close-range LNA saturation (<0.5m) */
     esp_wifi_set_max_tx_power(68);
 
     ESP_LOGI(TAG, "Connecting to Wi-Fi: '%s'...", s_current_ssid);
-    /* [H7 FIX] Check initial connect return code */
-    esp_err_t conn_err = esp_wifi_connect();
-    if (conn_err != ESP_OK) {
-        ESP_LOGW(TAG, "Initial esp_wifi_connect returned: %s. Reconnect timer will handle retry.", esp_err_to_name(conn_err));
-    }
+    esp_wifi_connect();
 
     return ESP_OK;
 }
@@ -419,33 +363,29 @@ esp_err_t wifi_sta_wait_connected(TickType_t timeout_ticks) {
     return ESP_OK;
 }
 
-/* [M7 FIX] Official ESP-IDF SNTP synchronization status check with calendar epoch guard */
 bool wifi_sta_is_time_synced(void) {
     time_t now = 0;
     time(&now);
-    if (now > 1700000000) {
-        return true;
-    }
-    return (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED);
+    return (now > 1700000000);
 }
 
 esp_err_t wifi_sta_wait_time_sync(uint32_t timeout_ms) {
     if (wifi_sta_is_time_synced()) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        if (s_sntp_cb != NULL) {
+            s_sntp_cb(&tv);
+        }
         return ESP_OK;
     }
     esp_err_t err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(timeout_ms));
     if (err == ESP_OK && wifi_sta_is_time_synced()) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        if (s_sntp_cb != NULL) {
+            s_sntp_cb(&tv);
+        }
         return ESP_OK;
     }
     return wifi_sta_is_time_synced() ? ESP_OK : ESP_ERR_TIMEOUT;
-}
-
-esp_err_t wifi_sta_get_power_save(int *out_ps_mode) {
-    if (out_ps_mode == NULL) return ESP_ERR_INVALID_ARG;
-    wifi_ps_type_t ps_type = WIFI_PS_NONE;
-    esp_err_t err = esp_wifi_get_ps(&ps_type);
-    if (err == ESP_OK) {
-        *out_ps_mode = (int)ps_type;
-    }
-    return err;
 }

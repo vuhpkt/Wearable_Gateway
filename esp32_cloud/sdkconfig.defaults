@@ -1,9 +1,8 @@
 # Target SoC
 CONFIG_IDF_TARGET="esp32s3"
 
-# CPU Frequency: Fixed 160MHz for thermal reduction and optimal power consumption
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=160
+# CPU Frequency (240MHz for high throughput telemetry & crypto)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
 # Flash Size (16MB for N16 module)
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
@@ -26,11 +25,8 @@ CONFIG_LOG_COLORS=y
 # Partition Table: Single factory app, large (nearly 2MB)
 CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 
-# SNTP: Multi-server pool support for reliable real-time sync
-CONFIG_LWIP_SNTP_MAX_SERVERS=3
-
-# TLS: Support cross-signed certificate chains (Cloudflare GTS Root R4 -> GlobalSign)
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+# Custom Static MQTT Outbox (Architecture v2 Zero-Heap & 5000ms TTL)
+CONFIG_MQTT_USE_CUSTOM_CONFIG=y
+CONFIG_MQTT_CUSTOM_OUTBOX=y
+CONFIG_MQTT_OUTBOX_EXPIRED_TIMEOUT_MS=5000
 
