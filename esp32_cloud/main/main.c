@@ -16,14 +16,33 @@
 #include <esp_log.h>
 #include <esp_netif.h>
 #include <esp_system.h>
+#include <esp_timer.h>
+#include <sys/time.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
 
-#include "gateway_subsystems.h"
+#include "wifi_manager.h"
+#include "uart_bridge.h"
+#include "thingsboard_client.h"
+#include "cloud_uplink.h"
 #include "system_health.h"
 
 static const char *TAG = "gateway_root";
+
+/* Wi-Fi IP acquisition callback -> Resumes MQTT client */
+static void on_wifi_ip_assigned(void) {
+    ESP_LOGI(TAG, "Wi-Fi IP acquired -> resuming MQTT client");
+    tb_mqtt_resume();
+}
+
+/* SNTP Time Sync callback -> Forwards UTC clock observation to Core 1 via mailbox */
+static void on_sntp_sync(struct timeval *tv) {
+    if (!tv) return;
+    int64_t now_utc_ms = (int64_t)tv->tv_sec * 1000LL + (int64_t)(tv->tv_usec / 1000);
+    uint64_t esp_mono_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
+    uart_bridge_post_sntp(now_utc_ms, esp_mono_ms);
+}
 
 /* Control Queue (Static Allocation) */
 #define CONTROL_QUEUE_SIZE      8
@@ -105,8 +124,14 @@ void app_main(void) {
                                          s_control_queue_storage, &s_control_queue_struct);
     assert(s_control_queue != NULL);
 
-    /* 1-Line Bootstrap: Ingest Subsystem -> Cloud Uplink -> Wi-Fi Manager */
-    ESP_ERROR_CHECK(gateway_subsystems_init(s_control_queue));
+    /* 1. Ingest & Bridge Subsystem (Spinlocks, Mailbox, Time, Queue, Rev Table) */
+    ESP_ERROR_CHECK(uart_bridge_subsystem_init());
+
+    /* 2. Cloud Uplink Subsystem (Default Instance, MQTT Lifecycle, Buffers) */
+    cloud_uplink_default_init();
+
+    /* 3. Wi-Fi Manager (NVS, STA/AP, Provisioning FSM, SNTP Callback) */
+    ESP_ERROR_CHECK(wifi_mgr_setup(s_control_queue, on_wifi_ip_assigned, tb_mqtt_pause, on_sntp_sync));
 
     s_control_task_handle = xTaskCreateStaticPinnedToCore(
         control_task, "control_task", TASK_STACK_SIZE, NULL, 4,

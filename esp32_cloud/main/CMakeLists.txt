@@ -2,7 +2,6 @@ idf_component_register(
     SRCS
         "main.c"
         "system_health.c"
-        "gateway_subsystems.c"
     INCLUDE_DIRS
         "."
     REQUIRES
