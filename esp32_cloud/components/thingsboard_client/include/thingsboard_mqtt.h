@@ -46,6 +46,7 @@ typedef struct {
     int               attr_msg_id;
     uint32_t          generation;
     node_mqtt_state_t state;
+    uint64_t          announce_start_mono_ms;
 } node_mqtt_tracker_t;
 
 typedef struct {
@@ -98,6 +99,14 @@ bool mqtt_lifecycle_can_publish_telemetry(mqtt_lifecycle_mgr_t *mgr,
                                           uint64_t event_utc_ms,
                                           uint64_t current_utc_ms,
                                           uint32_t ttl_ms);
+
+void mqtt_lifecycle_set_announce_time(mqtt_lifecycle_mgr_t *mgr,
+                                      uint8_t node_id,
+                                      uint64_t mono_ms);
+
+void mqtt_lifecycle_check_timeouts(mqtt_lifecycle_mgr_t *mgr,
+                                   uint64_t now_mono_ms,
+                                   uint64_t timeout_ms);
 
 /* ══════════════════════════════════════════════════════════════
  *  Hardware MQTT Client APIs

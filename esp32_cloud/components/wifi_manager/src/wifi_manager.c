@@ -1,11 +1,17 @@
 #include "wifi_manager.h"
 #include "wifi_config.h"
+#include "wifi_sta_mgr.h"
+#include "wifi_ap.h"
+#include "wifi_portal.h"
+#include "boot_button.h"
+#include "nvs_storage.h"
+#include "provisioning_fsm.h"
 #include <string.h>
 #include "esp_log.h"
 
 static const char *TAG = "WIFI_MGR";
 
-esp_err_t wifi_mgr_init(wifi_mgr_ip_callback_t on_ip_cb) {
+static esp_err_t wifi_mgr_init(wifi_mgr_ip_callback_t on_ip_cb) {
     nvs_storage_init();
 
     if (on_ip_cb != NULL) {
@@ -15,7 +21,7 @@ esp_err_t wifi_mgr_init(wifi_mgr_ip_callback_t on_ip_cb) {
     return ESP_OK;
 }
 
-esp_err_t wifi_mgr_start(void) {
+static esp_err_t wifi_mgr_start(void) {
     char ssid[33] = {0};
     char pass[65] = {0};
     esp_err_t err = nvs_storage_read_wifi(ssid, sizeof(ssid), pass, sizeof(pass));
@@ -111,7 +117,7 @@ static const prov_adapter_t s_prov_adapter = {
     .connect_sta = adapter_connect_sta,
 };
 
-void wifi_mgr_prov_init(QueueHandle_t control_queue, prov_fsm_t *fsm, void (*pause_mqtt_cb)(void)) {
+static void wifi_mgr_prov_init(QueueHandle_t control_queue, prov_fsm_t *fsm, void (*pause_mqtt_cb)(void)) {
     s_prov_queue = control_queue;
     s_prov_fsm_ptr = fsm ? fsm : &s_default_prov_fsm;
     s_pause_mqtt_cb = pause_mqtt_cb;

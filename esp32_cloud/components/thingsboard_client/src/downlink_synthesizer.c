@@ -109,6 +109,14 @@ static const char *json_find_key(const char *json, const char *key) {
 static bool json_read_int(const char *json, const char *key, int32_t *val_out) {
     const char *p = json_find_key(json, key);
     if (!p) return false;
+    if (strncmp(p, "true", 4) == 0 || strncmp(p, "TRUE", 4) == 0) {
+        if (val_out) *val_out = 1;
+        return true;
+    }
+    if (strncmp(p, "false", 5) == 0 || strncmp(p, "FALSE", 5) == 0) {
+        if (val_out) *val_out = 0;
+        return true;
+    }
     char *endptr;
     long v = strtol(p, &endptr, 10);
     if (endptr == p) return false;
@@ -155,14 +163,18 @@ int downlink_synth_parse_json(const char *json_str, uint8_t *out_buf, uint8_t ma
     /* 1. Mode Configuration: CMD_MODE_CFG (0xCB) - 7 bytes */
     if (json_find_key(json_str, "deviceMode") != NULL ||
         json_find_key(json_str, "periodicInterval") != NULL ||
-        json_find_key(json_str, "captureWindow") != NULL) {
+        json_find_key(json_str, "captureWindow") != NULL ||
+        json_find_key(json_str, "showEcg") != NULL ||
+        json_find_key(json_str, "ecgEnabled") != NULL) {
         if (max_out_len < 7) return -2;
 
         int32_t mode = 0, period = 30, capture = 10, ecg_en = 1;
         json_read_int(json_str, "deviceMode", &mode);
         json_read_int(json_str, "periodicInterval", &period);
         json_read_int(json_str, "captureWindow", &capture);
-        json_read_int(json_str, "ecgEnabled", &ecg_en);
+        if (!json_read_int(json_str, "showEcg", &ecg_en)) {
+            json_read_int(json_str, "ecgEnabled", &ecg_en);
+        }
 
         if (mode < 0 || mode >= 3) {
             return -3; // Invalid mode (0=CONTINUOUS, 1=PERIODIC, 2=ECG)

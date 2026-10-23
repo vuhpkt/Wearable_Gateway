@@ -28,6 +28,7 @@ void gateway_ingest_init(gateway_ingest_t *ingest,
     ingest->gateway_time = gt;
     ingest->time_mailbox = time_mb;
     ingest->last_sync_req_mono = -100000;
+    ingest->last_snapshot_req_mono = -100000;
 }
 
 bool gateway_ingest_is_link_ready(const gateway_ingest_t *ingest) {
@@ -154,11 +155,15 @@ void gateway_ingest_on_frame(gateway_ingest_t *ingest, const uart_rx_frame_t *fr
 
         if (ingest->snapshot_queue) {
             if (!frame_snapshot_queue_push_control(ingest->snapshot_queue, &tuple)) {
-                ESP_LOGW(TAG, "⚠️ [CONTROL QUEUE FULL] Dropped control frame for slot %u (type=%u) -> Triggering Snapshot Resync",
-                         frame->node_id, tuple.stream_type);
-                uart_snapshot_req_pkt_t req;
-                uart_bridge_request_snapshot(&ingest->bridge_fsm, &req);
-                uart_bridge_tx_frame(0, UART_PKT_TYPE_SNAPSHOT_REQ, &req, sizeof(req));
+                int64_t now_mono = (int64_t)tuple.esp_rx_mono_ms;
+                if (now_mono - ingest->last_snapshot_req_mono >= 2000) {
+                    ingest->last_snapshot_req_mono = now_mono;
+                    ESP_LOGW(TAG, "⚠️ [CONTROL QUEUE FULL] Dropped control frame for slot %u (type=%u) -> Triggering Snapshot Resync",
+                             frame->node_id, tuple.stream_type);
+                    uart_snapshot_req_pkt_t req;
+                    uart_bridge_request_snapshot(&ingest->bridge_fsm, &req);
+                    uart_bridge_tx_frame(0, UART_PKT_TYPE_SNAPSHOT_REQ, &req, sizeof(req));
+                }
             }
         }
         return;
@@ -180,9 +185,13 @@ void gateway_ingest_on_frame(gateway_ingest_t *ingest, const uart_rx_frame_t *fr
             int ret = core1_gate_validate_telemetry(&ingest->core1_gate, frame->node_id, env, mac);
             if (ret != CORE1_GATE_OK) {
                 if (core1_gate_is_snapshot_requested(&ingest->core1_gate)) {
-                    uart_snapshot_req_pkt_t req;
-                    uart_bridge_request_snapshot(&ingest->bridge_fsm, &req);
-                    uart_bridge_tx_frame(0, UART_PKT_TYPE_SNAPSHOT_REQ, &req, sizeof(req));
+                    int64_t now_mono = (int64_t)tuple.esp_rx_mono_ms;
+                    if (now_mono - ingest->last_snapshot_req_mono >= 2000) {
+                        ingest->last_snapshot_req_mono = now_mono;
+                        uart_snapshot_req_pkt_t req;
+                        uart_bridge_request_snapshot(&ingest->bridge_fsm, &req);
+                        uart_bridge_tx_frame(0, UART_PKT_TYPE_SNAPSHOT_REQ, &req, sizeof(req));
+                    }
                     core1_gate_clear_snapshot_request(&ingest->core1_gate);
                 }
                 return;

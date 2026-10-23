@@ -48,6 +48,19 @@ esp_err_t uart_bridge_init(void);
  */
 int uart_bridge_send_sync_req(void);
 
+/**
+ * @brief Trigger a SNAPSHOT_REQ to nRF Central to resync active BLE node states
+ */
+int uart_bridge_trigger_snapshot_sync(void);
+
+/**
+ * @brief Transmit raw UART frame bytes to nRF Central (e.g. packed 0x80 Downlink frame)
+ * @param frame_data Pointer to raw frame buffer
+ * @param len Length of frame data in bytes
+ * @return Number of bytes written, or negative on error
+ */
+int uart_bridge_tx_raw(const uint8_t *frame_data, size_t len);
+
 /* ══════════════════════════════════════════════════════════════
  *  Hybrid Facade APIs (Inter-Core Bridge & Ingest Subsystem)
  * ════════════════════════════════════════════════════════════ */

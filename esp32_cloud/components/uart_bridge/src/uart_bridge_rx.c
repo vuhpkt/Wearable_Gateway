@@ -188,4 +188,17 @@ int uart_bridge_tx_frame(uint8_t node_id, uint8_t pkt_type, const void *payload,
     int written = uart_write_bytes(UART_BRIDGE_PORT, (const char *)frame_buf, frame_len);
     return written;
 }
+
+int uart_bridge_tx_raw(const uint8_t *frame_data, size_t len) {
+    if (frame_data == NULL || len == 0) return -1;
+    return uart_write_bytes(UART_BRIDGE_PORT, (const char *)frame_data, len);
+}
+#else
+__attribute__((weak)) int uart_bridge_tx_raw(const uint8_t *frame_data, size_t len) {
+    (void)frame_data;
+    return (int)len;
+}
+__attribute__((weak)) int uart_bridge_trigger_snapshot_sync(void) {
+    return 0;
+}
 #endif

@@ -3,6 +3,9 @@
 
 /* ESP-IDF System Headers */
 #include <esp_log.h>
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+#include <esp_timer.h>
+#endif
 
 /* Project Local Headers */
 #include "uart_rx_parser.h"
@@ -96,8 +99,18 @@ static void parse_byte(uint8_t byte) {
                 }
             } else {
                 s_crc_errors++;
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+                static int64_t s_last_crc_log_ms = 0;
+                int64_t now_crc_ms = (int64_t)(esp_timer_get_time() / 1000ULL);
+                if (now_crc_ms - s_last_crc_log_ms >= 1000) {
+                    s_last_crc_log_ms = now_crc_ms;
+                    ESP_LOGW(TAG, "CRC Drop! Recv=0x%02X != Calc=0x%02X (Node=%u, Type=0x%02X, Total Errors=%lu)",
+                             byte, expected_crc, s_current_frame.node_id, s_current_frame.pkt_type, (unsigned long)s_crc_errors);
+                }
+#else
                 ESP_LOGW(TAG, "CRC Drop! Recv=0x%02X != Calc=0x%02X (Node=%u, Type=0x%02X, Total Errors=%lu)",
                          byte, expected_crc, s_current_frame.node_id, s_current_frame.pkt_type, s_crc_errors);
+#endif
             }
             /* Luôn reset về WAIT_SOF để đón khung tiếp theo */
             s_state = PARSER_STATE_WAIT_SOF;

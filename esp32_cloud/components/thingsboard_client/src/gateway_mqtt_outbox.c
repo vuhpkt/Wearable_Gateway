@@ -75,7 +75,13 @@ outbox_item_handle_t outbox_enqueue(outbox_handle_t outbox, outbox_message_handl
 
     if (free_slots == 0 || free_idx < 0) {
         outbox->stats.dropped_full++;
-        ESP_LOGW(TAG, "Outbox pool exhausted (%u items), dropping packet msg_id=%d", GATEWAY_OUTBOX_MAX_ITEMS, message->msg_id);
+        static bool s_has_logged = false;
+        static outbox_tick_t s_last_outbox_log_tick = 0;
+        if (!s_has_logged || tick >= s_last_outbox_log_tick + 1000) {
+            s_has_logged = true;
+            s_last_outbox_log_tick = tick;
+            ESP_LOGW(TAG, "Outbox pool exhausted (%u items), dropping packet msg_id=%d", GATEWAY_OUTBOX_MAX_ITEMS, message->msg_id);
+        }
         return NULL;
     }
 

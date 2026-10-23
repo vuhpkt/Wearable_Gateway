@@ -6,10 +6,6 @@
 
 #include "wifi_config.h"
 #include "wifi_sta_mgr.h"
-#include "wifi_ap.h"
-#include "wifi_portal.h"
-#include "boot_button.h"
-#include "nvs_storage.h"
 #include "provisioning_fsm.h"
 
 #ifndef HOST_UNIT_TEST
@@ -29,26 +25,6 @@ extern "C" {
 typedef void (*wifi_mgr_ip_callback_t)(void);
 
 /**
- * @brief Initialize all Wi-Fi manager subsystems (NVS, Boot Button, Wi-Fi Drivers)
- * @param on_ip_cb Callback fired when IP is acquired (can resume MQTT client)
- */
-esp_err_t wifi_mgr_init(wifi_mgr_ip_callback_t on_ip_cb);
-
-/**
- * @brief Initialize provisioning subsystem and bind callbacks to control queue
- * @param control_queue FreeRTOS queue for prov_event_t
- * @param fsm Pointer to prov_fsm_t to initialize
- * @param pause_mqtt_cb Optional callback to pause MQTT during AP mode
- */
-void wifi_mgr_prov_init(QueueHandle_t control_queue, prov_fsm_t *fsm, void (*pause_mqtt_cb)(void));
-
-/**
- * @brief Dispatch a provisioning event to the active Provisioning FSM
- * @param evt Pointer to event to dispatch
- */
-void wifi_mgr_prov_dispatch(const prov_event_t *evt);
-
-/**
  * @brief Consolidated Wi-Fi & Provisioning setup (NVS, STA, AP, Portal, SNTP)
  * @param control_queue Queue to receive provisioning events
  * @param on_ip_cb Callback fired when IP is acquired
@@ -61,9 +37,10 @@ esp_err_t wifi_mgr_setup(QueueHandle_t control_queue,
                          wifi_sta_sntp_cb_t sntp_cb);
 
 /**
- * @brief Start Wi-Fi station mode with stored or default credentials
+ * @brief Dispatch a provisioning event to the active Provisioning FSM
+ * @param evt Pointer to event to dispatch
  */
-esp_err_t wifi_mgr_start(void);
+void wifi_mgr_prov_dispatch(const prov_event_t *evt);
 
 /**
  * @brief Check if Wi-Fi station is connected and has valid IP

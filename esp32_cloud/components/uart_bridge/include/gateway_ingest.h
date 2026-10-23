@@ -25,6 +25,7 @@ struct gateway_ingest_s {
     gateway_time_t         *gateway_time;
     gateway_time_mailbox_t *time_mailbox;
     int64_t                 last_sync_req_mono;
+    int64_t                 last_snapshot_req_mono;
 };
 
 #include "uart_bridge.h"

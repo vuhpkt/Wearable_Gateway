@@ -90,8 +90,12 @@ static void cloud_consumer_task(void *pvParameters) {
 
     tb_mqtt_register_connect_callback(cloud_uplink_on_mqtt_connected_cb);
     tb_mqtt_register_publish_callback(cloud_uplink_on_mqtt_published_cb);
+    tb_mqtt_register_data_callback(cloud_uplink_on_mqtt_data_cb);
     tb_mqtt_init(TB_MQTT_BROKER_URI, TB_GATEWAY_ACCESS_TOKEN);
     tb_mqtt_wait_connected(portMAX_DELAY);
+
+    /* Request fresh node snapshot from nRF Central so connected nodes are announced immediately */
+    uart_bridge_trigger_snapshot_sync();
 
     if (wifi_sta_wait_time_sync(5000) == ESP_OK) {
         ESP_LOGI(TAG, "⏰ Real-time synchronized successfully via SNTP!");

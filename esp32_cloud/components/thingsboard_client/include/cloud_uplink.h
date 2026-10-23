@@ -13,6 +13,10 @@
 extern "C" {
 #endif
 
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+#include <freertos/FreeRTOS.h>
+#endif
+
 typedef enum {
     CLOUD_MQTT_EVT_CONNECTED = 1,
     CLOUD_MQTT_EVT_DISCONNECTED,
@@ -34,6 +38,8 @@ typedef struct {
 typedef struct {
     mqtt_lifecycle_mgr_t   lifecycle;
     pending_announce_t     pending_announces[MAX_NODES_SUPPORTED];
+    bool                   ecg_stream_enabled[MAX_NODES_SUPPORTED];
+    bool                   node_explicitly_disconnected[MAX_NODES_SUPPORTED];
     char                   tx_buffer[2048];
     char                   attr_buffer[512];
     
@@ -43,6 +49,9 @@ typedef struct {
     uint8_t                evt_tail;
     uint8_t                evt_count;
     uint32_t               evt_overflow_count;
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+    portMUX_TYPE           mux;
+#endif
 } cloud_uplink_t;
 
 void cloud_uplink_init(cloud_uplink_t *uplink);
@@ -75,12 +84,18 @@ int cloud_uplink_handle_downlink_attributes(cloud_uplink_t *uplink,
                                            uint8_t *out_uart_frame,
                                            size_t max_frame_len);
 
+/* Ingest MQTT data event (v1/gateway/attributes downlink) and forward to UART */
+void cloud_uplink_on_mqtt_data(cloud_uplink_t *uplink,
+                               const char *topic, size_t topic_len,
+                               const char *data, size_t data_len);
+
 /* ══════════════════════════════════════════════════════════════
  *  Hybrid Facade APIs (Operating on default internal instance)
  * ════════════════════════════════════════════════════════════ */
 void cloud_uplink_default_init(void);
 void cloud_uplink_on_mqtt_connected_cb(void);
 void cloud_uplink_on_mqtt_published_cb(int msg_id);
+void cloud_uplink_on_mqtt_data_cb(const char *topic, int topic_len, const char *data, int data_len);
 void cloud_uplink_default_process_events(void);
 void cloud_uplink_default_dispatch(const frame_snapshot_tuple_t *tuple);
 int  cloud_uplink_default_find_slot_by_mac(const uint8_t target_mac[6]);

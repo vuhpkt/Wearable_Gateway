@@ -32,16 +32,8 @@
 
 static const char *TAG = "wifi_sta";
 
-static wifi_sta_got_ip_cb_t s_got_ip_cb = NULL;
-
-void wifi_sta_set_got_ip_cb(wifi_sta_got_ip_cb_t cb) {
-    s_got_ip_cb = cb;
-}
-
 static esp_netif_t *s_netif_sta = NULL;
 static volatile bool s_is_connected = false;
-static volatile bool s_connect_failed = false;
-static volatile bool s_has_connected_once = false;
 static volatile bool s_sta_stopped = false;
 static uint32_t s_retry_count = 0;
 static char s_current_ssid[33] = {0};
@@ -50,9 +42,15 @@ static esp_timer_handle_t s_reconnect_timer = NULL;
 static esp_timer_handle_t s_sntp_resync_timer = NULL;
 static bool s_handlers_registered = false;
 static wifi_sta_sntp_cb_t s_sntp_cb = NULL;
+static wifi_sta_got_ip_cb_t s_got_ip_cb = NULL;
 
 void wifi_sta_set_sntp_cb(wifi_sta_sntp_cb_t cb) {
     s_sntp_cb = cb;
+}
+
+
+void wifi_sta_set_got_ip_cb(wifi_sta_got_ip_cb_t cb) {
+    s_got_ip_cb = cb;
 }
 
 static void sntp_sync_notification_cb(struct timeval *tv) {
@@ -78,7 +76,7 @@ static void on_reconnect_timer(void *arg) {
     if (s_sta_stopped) {
         return;
     }
-    if (!s_is_connected && !s_connect_failed) {
+    if (!s_is_connected) {
         ESP_LOGI(TAG, "Retrying Wi-Fi connection: '%s' (Attempt #%lu)...",
                  s_current_ssid, (unsigned long)s_retry_count + 1);
         esp_wifi_connect();
@@ -155,79 +153,97 @@ static void on_sntp_resync_timer(void *arg) {
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "Wi-Fi STA hardware started.");
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        s_is_connected = false;
+    (void)arg;
 
-        /* If Station was stopped intentionally (e.g. user pressed BOOT for SoftAP), do NOT retry */
-        if (s_sta_stopped) {
-            ESP_LOGI(TAG, "Wi-Fi Station disconnected (Station stopped as intended).");
+    if (event_base == WIFI_EVENT) {
+        switch (event_id) {
+        case WIFI_EVENT_STA_START:
+            ESP_LOGI(TAG, "Wi-Fi STA hardware started.");
+            break;
+
+        case WIFI_EVENT_STA_DISCONNECTED: {
+            s_is_connected = false;
+
+            /* If Station was stopped intentionally (e.g. user pressed BOOT for SoftAP), do NOT retry */
+            if (s_sta_stopped) {
+                ESP_LOGI(TAG, "Wi-Fi Station disconnected (Station stopped as intended).");
+                if (s_reconnect_timer != NULL) {
+                    esp_timer_stop(s_reconnect_timer);
+                }
+                return;
+            }
+
+            s_retry_count++;
+            /* 
+             * IMPORTANT:
+             * Do NOT invoke esp_wifi_disconnect() here.
+             * Driver v6.0.2 is already in disconnected state; invoking disconnect triggers Reason 36.
+             */
+            wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
+            uint8_t reason = disconn ? disconn->reason : 0;
+
+            uint32_t backoff_sec = wifi_calculate_backoff_sec(s_retry_count);
+            ESP_LOGW(TAG, "Wi-Fi disconnected (Reason: %u, Attempt #%lu). Retrying in %lu seconds...",
+                     reason, (unsigned long)s_retry_count, (unsigned long)backoff_sec);
+
+            if (s_reconnect_timer != NULL) {
+                esp_timer_stop(s_reconnect_timer);
+                esp_timer_start_once(s_reconnect_timer, (uint64_t)backoff_sec * 1000000ULL);
+            }
+            break;
+        }
+
+        default:
+            break;
+        }
+    } else if (event_base == IP_EVENT) {
+        switch (event_id) {
+        case IP_EVENT_STA_GOT_IP: {
+            ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+            ESP_LOGI(TAG, "===============================================================");
+            ESP_LOGI(TAG, ">>> WI-FI CONNECTED & IP ASSIGNED SUCCESSFULLY! <<<");
+            ESP_LOGI(TAG, "    SSID:    %s", s_current_ssid);
+            ESP_LOGI(TAG, "    IP:      " IPSTR, IP2STR(&event->ip_info.ip));
+            ESP_LOGI(TAG, "    Netmask: " IPSTR, IP2STR(&event->ip_info.netmask));
+            ESP_LOGI(TAG, "    Gateway: " IPSTR, IP2STR(&event->ip_info.gw));
+            ESP_LOGI(TAG, "===============================================================");
+
             if (s_reconnect_timer != NULL) {
                 esp_timer_stop(s_reconnect_timer);
             }
-            return;
-        }
+            s_retry_count = 0;
+            s_is_connected = true;
 
-        s_retry_count++;
-        /* 
-         * IMPORTANT:
-         * Do NOT invoke esp_wifi_disconnect() here.
-         * Driver v6.0.2 is already in disconnected state; invoking disconnect triggers Reason 36.
-         */
-        wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
-        uint8_t reason = disconn ? disconn->reason : 0;
+            /* Notify registered callback (e.g. to resume MQTT client) */
+            if (s_got_ip_cb != NULL) {
+                s_got_ip_cb();
+            }
 
-        uint32_t backoff_sec = wifi_calculate_backoff_sec(s_retry_count);
-        ESP_LOGW(TAG, "Wi-Fi disconnected (Reason: %u, Attempt #%lu). Retrying in %lu seconds...",
-                 reason, (unsigned long)s_retry_count, (unsigned long)backoff_sec);
+            static bool s_sntp_initialized = false;
+            if (!s_sntp_initialized) {
+                esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+                sntp_config.sync_cb = sntp_sync_notification_cb;
+                esp_netif_sntp_init(&sntp_config);
+                s_sntp_initialized = true;
+                ESP_LOGI(TAG, "⏰ [SNTP] Real-time clock synchronization started via pool.ntp.org");
 
-        if (s_reconnect_timer != NULL) {
-            esp_timer_stop(s_reconnect_timer);
-            esp_timer_start_once(s_reconnect_timer, (uint64_t)backoff_sec * 1000000ULL);
-        }
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "===============================================================");
-        ESP_LOGI(TAG, ">>> WI-FI CONNECTED & IP ASSIGNED SUCCESSFULLY! <<<");
-        ESP_LOGI(TAG, "    SSID:    %s", s_current_ssid);
-        ESP_LOGI(TAG, "    IP:      " IPSTR, IP2STR(&event->ip_info.ip));
-        ESP_LOGI(TAG, "    Netmask: " IPSTR, IP2STR(&event->ip_info.netmask));
-        ESP_LOGI(TAG, "    Gateway: " IPSTR, IP2STR(&event->ip_info.gw));
-        ESP_LOGI(TAG, "===============================================================");
-
-        if (s_reconnect_timer != NULL) {
-            esp_timer_stop(s_reconnect_timer);
-        }
-        s_retry_count = 0;
-        s_connect_failed = false;
-        s_is_connected = true;
-        s_has_connected_once = true;
-
-        /* Notify registered callback (e.g. to resume MQTT client) */
-        if (s_got_ip_cb != NULL) {
-            s_got_ip_cb();
-        }
-
-        static bool s_sntp_initialized = false;
-        if (!s_sntp_initialized) {
-            esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-            sntp_config.sync_cb = sntp_sync_notification_cb;
-            esp_netif_sntp_init(&sntp_config);
-            s_sntp_initialized = true;
-            ESP_LOGI(TAG, "⏰ [SNTP] Real-time clock synchronization started via pool.ntp.org");
-
-            if (s_sntp_resync_timer == NULL) {
-                esp_timer_create_args_t tmr_args = {
-                    .callback = on_sntp_resync_timer,
-                    .arg = NULL,
-                    .dispatch_method = ESP_TIMER_TASK,
-                    .name = "sntp_resync_tmr"
-                };
-                if (esp_timer_create(&tmr_args, &s_sntp_resync_timer) == ESP_OK) {
-                    esp_timer_start_periodic(s_sntp_resync_timer, 3600ULL * 1000000ULL);
+                if (s_sntp_resync_timer == NULL) {
+                    esp_timer_create_args_t tmr_args = {
+                        .callback = on_sntp_resync_timer,
+                        .arg = NULL,
+                        .dispatch_method = ESP_TIMER_TASK,
+                        .name = "sntp_resync_tmr"
+                    };
+                    if (esp_timer_create(&tmr_args, &s_sntp_resync_timer) == ESP_OK) {
+                        esp_timer_start_periodic(s_sntp_resync_timer, 3600ULL * 1000000ULL);
+                    }
                 }
             }
+            break;
+        }
+
+        default:
+            break;
         }
     }
 }
@@ -238,7 +254,6 @@ esp_err_t wifi_sta_init_with_creds(const char *ssid, const char *password) {
     }
 
     s_is_connected = false;
-    s_connect_failed = false;
     s_sta_stopped = false;
     s_retry_count = 0;
 
@@ -332,10 +347,6 @@ bool wifi_sta_is_connected(void) {
     return s_is_connected;
 }
 
-bool wifi_sta_has_failed(void) {
-    return s_connect_failed;
-}
-
 void wifi_sta_stop(void) {
     s_sta_stopped = true;
     s_is_connected = false;
@@ -351,9 +362,6 @@ esp_err_t wifi_sta_wait_connected(TickType_t timeout_ticks) {
     while (!s_is_connected) {
         if (s_sta_stopped) {
             return ESP_ERR_INVALID_STATE;
-        }
-        if (s_connect_failed) {
-            return ESP_FAIL;
         }
         if (timeout_ticks != portMAX_DELAY && (xTaskGetTickCount() - start) > timeout_ticks) {
             return ESP_ERR_TIMEOUT;

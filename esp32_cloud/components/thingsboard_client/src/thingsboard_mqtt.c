@@ -3,6 +3,10 @@
 #include <stdint.h>
 #include <string.h>
 
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+#include "esp_timer.h"
+#endif
+
 #include "thingsboard_mqtt.h"
 
 /* ══════════════════════════════════════════════════════════════
@@ -22,6 +26,7 @@ void mqtt_lifecycle_on_broker_connected(mqtt_lifecycle_mgr_t *mgr) {
         mgr->nodes[i].state = NODE_MQTT_STATE_IDLE;
         mgr->nodes[i].connect_msg_id = 0;
         mgr->nodes[i].attr_msg_id = 0;
+        mgr->nodes[i].announce_start_mono_ms = 0;
     }
 }
 
@@ -32,6 +37,7 @@ void mqtt_lifecycle_on_broker_disconnected(mqtt_lifecycle_mgr_t *mgr) {
         mgr->nodes[i].state = NODE_MQTT_STATE_IDLE;
         mgr->nodes[i].connect_msg_id = 0;
         mgr->nodes[i].attr_msg_id = 0;
+        mgr->nodes[i].announce_start_mono_ms = 0;
     }
 }
 
@@ -50,6 +56,11 @@ int mqtt_lifecycle_start_announce(mqtt_lifecycle_mgr_t *mgr,
     n->attr_msg_id = 0;
     n->generation = mgr->mqtt_generation;
     n->state = NODE_MQTT_STATE_WAIT_CONNECT_ACK;
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+    n->announce_start_mono_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
+#else
+    n->announce_start_mono_ms = 0;
+#endif
     mgr->connect_published_count++;
     return 0;
 }
@@ -75,6 +86,7 @@ int mqtt_lifecycle_handle_puback(mqtt_lifecycle_mgr_t *mgr,
         }
         if (n->state == NODE_MQTT_STATE_WAIT_ATTR_ACK && n->attr_msg_id == pub_msg_id) {
             n->state = NODE_MQTT_STATE_ACTIVE;
+            n->announce_start_mono_ms = 0;
             mgr->attr_ack_count++;
             if (out_node_id) *out_node_id = i;
             if (out_ready_for_attributes) *out_ready_for_attributes = false;
@@ -130,16 +142,41 @@ bool mqtt_lifecycle_can_publish_telemetry(mqtt_lifecycle_mgr_t *mgr,
         if (mgr) mgr->telemetry_blocked_count++;
         return false;
     }
-    if (event_utc_ms == 0 || current_utc_ms < event_utc_ms) {
+    /* Clock skew tolerance: allow up to 2000ms in the future */
+    if (event_utc_ms == 0 || event_utc_ms > current_utc_ms + 2000ULL) {
         mgr->telemetry_blocked_count++;
         return false;
     }
-    uint64_t age = current_utc_ms - event_utc_ms;
-    if (age >= (uint64_t)ttl_ms) {
-        mgr->ttl_dropped_count++;
-        return false;
+    if (current_utc_ms > event_utc_ms) {
+        uint64_t age = current_utc_ms - event_utc_ms;
+        if (age >= (uint64_t)ttl_ms) {
+            mgr->ttl_dropped_count++;
+            return false;
+        }
     }
     return true;
+}
+
+void mqtt_lifecycle_set_announce_time(mqtt_lifecycle_mgr_t *mgr, uint8_t node_id, uint64_t mono_ms) {
+    if (!mgr || node_id >= MAX_NODES_SUPPORTED) return;
+    mgr->nodes[node_id].announce_start_mono_ms = mono_ms;
+}
+
+void mqtt_lifecycle_check_timeouts(mqtt_lifecycle_mgr_t *mgr, uint64_t now_mono_ms, uint64_t timeout_ms) {
+    if (!mgr || timeout_ms == 0) return;
+    for (uint8_t i = 0; i < MAX_NODES_SUPPORTED; i++) {
+        node_mqtt_tracker_t *n = &mgr->nodes[i];
+        if (n->state == NODE_MQTT_STATE_WAIT_CONNECT_ACK || n->state == NODE_MQTT_STATE_WAIT_ATTR_ACK) {
+            if (n->announce_start_mono_ms > 0 && now_mono_ms >= n->announce_start_mono_ms) {
+                if (now_mono_ms - n->announce_start_mono_ms >= timeout_ms) {
+                    n->state = NODE_MQTT_STATE_IDLE;
+                    n->connect_msg_id = 0;
+                    n->attr_msg_id = 0;
+                    n->announce_start_mono_ms = 0;
+                }
+            }
+        }
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════

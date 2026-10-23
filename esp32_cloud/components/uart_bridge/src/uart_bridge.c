@@ -53,6 +53,16 @@ int uart_bridge_send_sync_req(void) {
     return uart_bridge_tx_frame(0, UART_PKT_TYPE_CONTROL_SYNC_REQ, &dummy, 1);
 }
 
+int uart_bridge_trigger_snapshot_sync(void) {
+    uart_snapshot_req_pkt_t req;
+    if (uart_bridge_request_snapshot(&s_bridge_ingest.bridge_fsm, &req) == 0) {
+        ESP_LOGI(TAG, "📋 Triggering proactive SNAPSHOT_REQ to Central (tx_id=%u, epoch=%llu)",
+                 (unsigned)req.transaction_id, (unsigned long long)req.bridge_epoch);
+        return uart_bridge_tx_frame(0, UART_PKT_TYPE_SNAPSHOT_REQ, &req, sizeof(req));
+    }
+    return -1;
+}
+
 esp_err_t uart_bridge_init(void) {
     esp_err_t err = uart_bridge_rx_init();
     if (err != ESP_OK) {
@@ -68,6 +78,9 @@ esp_err_t uart_bridge_init(void) {
 }
 #else
 int uart_bridge_send_sync_req(void) {
+    return 0;
+}
+int uart_bridge_trigger_snapshot_sync(void) {
     return 0;
 }
 #endif
