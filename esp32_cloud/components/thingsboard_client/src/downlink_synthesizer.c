@@ -109,6 +109,11 @@ static const char *json_find_key(const char *json, const char *key) {
 static bool json_read_int(const char *json, const char *key, int32_t *val_out) {
     const char *p = json_find_key(json, key);
     if (!p) return false;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p == '"') {
+        p++;
+        while (*p && isspace((unsigned char)*p)) p++;
+    }
     if (strncmp(p, "true", 4) == 0 || strncmp(p, "TRUE", 4) == 0) {
         if (val_out) *val_out = 1;
         return true;
@@ -127,6 +132,11 @@ static bool json_read_int(const char *json, const char *key, int32_t *val_out) {
 static bool json_read_float(const char *json, const char *key, float *val_out) {
     const char *p = json_find_key(json, key);
     if (!p) return false;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p == '"') {
+        p++;
+        while (*p && isspace((unsigned char)*p)) p++;
+    }
     char *endptr;
     float v = strtof(p, &endptr);
     if (endptr == p) return false;

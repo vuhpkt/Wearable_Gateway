@@ -5,6 +5,12 @@
 
 #if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
 #include "esp_timer.h"
+#define GET_MONO_MS() ((uint64_t)(esp_timer_get_time() / 1000ULL))
+#else
+static inline uint64_t get_host_mono_ms(void) {
+    return 100000ULL;
+}
+#define GET_MONO_MS() get_host_mono_ms()
 #endif
 
 #include "thingsboard_mqtt.h"
@@ -56,11 +62,7 @@ int mqtt_lifecycle_start_announce(mqtt_lifecycle_mgr_t *mgr,
     n->attr_msg_id = 0;
     n->generation = mgr->mqtt_generation;
     n->state = NODE_MQTT_STATE_WAIT_CONNECT_ACK;
-#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
-    n->announce_start_mono_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
-#else
-    n->announce_start_mono_ms = 0;
-#endif
+    n->announce_start_mono_ms = GET_MONO_MS();
     mgr->connect_published_count++;
     return 0;
 }

@@ -149,9 +149,21 @@ void cloud_uplink_process_events(cloud_uplink_t *uplink) {
 
 void cloud_uplink_handle_node_status(cloud_uplink_t *uplink, const frame_snapshot_tuple_t *tuple, bool is_connected) {
     if (!uplink || !tuple || tuple->node_id >= MAX_NODES_SUPPORTED) return;
-    if (!is_valid_mac_address(tuple->mac)) return;
 
     node_mqtt_tracker_t *n = &uplink->lifecycle.nodes[tuple->node_id];
+    frame_snapshot_tuple_t local_tuple = *tuple;
+
+    if (!is_valid_mac_address(local_tuple.mac)) {
+        /* If Central reports slot disconnected/empty with zero MAC, but our tracker
+         * still has an ACTIVE or in-flight connection for this slot, use the known MAC
+         * to cleanly disconnect the node and notify ThingsBoard. */
+        if (!is_connected && n->state != NODE_MQTT_STATE_IDLE && is_valid_mac_address(n->mac)) {
+            memcpy(local_tuple.mac, n->mac, 6);
+        } else {
+            return;
+        }
+    }
+
     const char *topic = NULL;
 
     if (is_connected) {
@@ -160,10 +172,10 @@ void cloud_uplink_handle_node_status(cloud_uplink_t *uplink, const frame_snapsho
          * in the current MQTT generation, DO NOT DEMOTE OR RE-ANNOUNCE! */
         if (n->state == NODE_MQTT_STATE_ACTIVE &&
             n->generation == uplink->lifecycle.mqtt_generation &&
-            n->session_id == tuple->session_id &&
-            memcmp(n->mac, tuple->mac, 6) == 0) {
+            n->session_id == local_tuple.session_id &&
+            memcmp(n->mac, local_tuple.mac, 6) == 0) {
             ESP_LOGD(TAG, "🟢 [NODE %u STATUS] Already ACTIVE (sess=%lu), ignoring redundant connect",
-                     tuple->node_id, (unsigned long)tuple->session_id);
+                     tuple->node_id, (unsigned long)local_tuple.session_id);
             return;
         }
 
@@ -172,22 +184,36 @@ void cloud_uplink_handle_node_status(cloud_uplink_t *uplink, const frame_snapsho
          * and generation, DO NOT overwrite msg_id and reset state! */
         if ((n->state == NODE_MQTT_STATE_WAIT_CONNECT_ACK || n->state == NODE_MQTT_STATE_WAIT_ATTR_ACK) &&
             n->generation == uplink->lifecycle.mqtt_generation &&
-            n->session_id == tuple->session_id &&
-            memcmp(n->mac, tuple->mac, 6) == 0) {
+            n->session_id == local_tuple.session_id &&
+            memcmp(n->mac, local_tuple.mac, 6) == 0) {
             ESP_LOGD(TAG, "🟢 [NODE %u STATUS] Announce already in flight (state=%d, sess=%lu), ignoring duplicate",
-                     tuple->node_id, (int)n->state, (unsigned long)tuple->session_id);
+                     tuple->node_id, (int)n->state, (unsigned long)local_tuple.session_id);
             return;
         }
 
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+        portENTER_CRITICAL(&uplink->mux);
+#endif
         uplink->node_explicitly_disconnected[tuple->node_id] = false;
-        int len = synth_format_mac_connect(uplink->tx_buffer, sizeof(uplink->tx_buffer), tuple->mac, &topic);
+        uplink->ecg_stream_enabled[tuple->node_id] = true; /* Reset to enabled for new connection */
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+        portEXIT_CRITICAL(&uplink->mux);
+#endif
+
+        int len = synth_format_mac_connect(uplink->tx_buffer, sizeof(uplink->tx_buffer), local_tuple.mac, &topic);
         if (len > 0 && topic != NULL) {
             int msg_id = tb_mqtt_publish(topic, uplink->tx_buffer, 1);
             if (msg_id > 0) {
                 ESP_LOGI(TAG, "📤 [NODE %u CONNECT] Published to %s (msg_id=%d)", tuple->node_id, topic, msg_id);
-                mqtt_lifecycle_start_announce(&uplink->lifecycle, tuple->node_id, tuple->mac, tuple->session_id, msg_id);
-                uplink->pending_announces[tuple->node_id].tuple = *tuple;
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+                portENTER_CRITICAL(&uplink->mux);
+#endif
+                mqtt_lifecycle_start_announce(&uplink->lifecycle, tuple->node_id, local_tuple.mac, local_tuple.session_id, msg_id);
+                uplink->pending_announces[tuple->node_id].tuple = local_tuple;
                 uplink->pending_announces[tuple->node_id].has_pending = true;
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+                portEXIT_CRITICAL(&uplink->mux);
+#endif
             } else {
                 ESP_LOGW(TAG, "⚠️ [NODE %u CONNECT] Failed to publish connect to %s (err=%d)", tuple->node_id, topic, msg_id);
             }
@@ -199,21 +225,43 @@ void cloud_uplink_handle_node_status(cloud_uplink_t *uplink, const frame_snapsho
             return;
         }
 
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+        portENTER_CRITICAL(&uplink->mux);
+#endif
         uplink->node_explicitly_disconnected[tuple->node_id] = true;
+        uplink->ecg_stream_enabled[tuple->node_id] = true; /* Reset to default on disconnect */
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+        portEXIT_CRITICAL(&uplink->mux);
+#endif
         /* Immediate offline attribute latch */
-        int attr_len = synth_format_mac_attributes(uplink->attr_buffer, sizeof(uplink->attr_buffer), tuple, false, "gw-01");
+        int attr_len = synth_format_mac_attributes(uplink->attr_buffer, sizeof(uplink->attr_buffer), &local_tuple, false, "gw-01");
         if (attr_len > 0) {
             tb_mqtt_publish("v1/gateway/attributes", uplink->attr_buffer, 1);
             ESP_LOGI(TAG, "📤 [NODE %u DISCONNECT ATTR] Published bleConnected=false to v1/gateway/attributes", tuple->node_id);
         }
 
-        int len = synth_format_mac_disconnect(uplink->tx_buffer, sizeof(uplink->tx_buffer), tuple->mac, &topic);
+        int len = synth_format_mac_disconnect(uplink->tx_buffer, sizeof(uplink->tx_buffer), local_tuple.mac, &topic);
         if (len > 0 && topic != NULL) {
             tb_mqtt_publish(topic, uplink->tx_buffer, 1);
             ESP_LOGI(TAG, "📤 [NODE %u DISCONNECT] Published to %s", tuple->node_id, topic);
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+            portENTER_CRITICAL(&uplink->mux);
+#endif
             mqtt_lifecycle_handle_node_disconnect(&uplink->lifecycle, tuple->node_id);
+            uplink->pending_announces[tuple->node_id].has_pending = false;
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+            portEXIT_CRITICAL(&uplink->mux);
+#endif
+        } else {
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+            portENTER_CRITICAL(&uplink->mux);
+#endif
+            mqtt_lifecycle_handle_node_disconnect(&uplink->lifecycle, tuple->node_id);
+            uplink->pending_announces[tuple->node_id].has_pending = false;
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+            portEXIT_CRITICAL(&uplink->mux);
+#endif
         }
-        uplink->pending_announces[tuple->node_id].has_pending = false;
     }
 }
 
@@ -294,7 +342,15 @@ void cloud_uplink_process_telemetry(cloud_uplink_t *uplink, const frame_snapshot
     }
 
     case STREAM_TYPE_ECG: {
-        if (!uplink->ecg_stream_enabled[tuple->node_id]) {
+        bool ecg_enabled = true;
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+        portENTER_CRITICAL(&uplink->mux);
+        ecg_enabled = uplink->ecg_stream_enabled[tuple->node_id];
+        portEXIT_CRITICAL(&uplink->mux);
+#else
+        ecg_enabled = uplink->ecg_stream_enabled[tuple->node_id];
+#endif
+        if (!ecg_enabled) {
             return; /* Gateway-level Gating: drop ECG telemetry when stream is disabled */
         }
         uint16_t sample_count = tuple->payload_len / sizeof(int16_t);
@@ -344,6 +400,11 @@ void cloud_uplink_dispatch_tuple(cloud_uplink_t *uplink, const frame_snapshot_tu
 #endif
 
     mqtt_lifecycle_check_timeouts(&uplink->lifecycle, current_mono_ms, 5000);
+    for (uint8_t i = 0; i < MAX_NODES_SUPPORTED; i++) {
+        if (uplink->lifecycle.nodes[i].state == NODE_MQTT_STATE_IDLE && uplink->pending_announces[i].has_pending) {
+            uplink->pending_announces[i].has_pending = false;
+        }
+    }
 
     if (tuple->stream_type == STREAM_TYPE_STATUS) {
         uint8_t status = tuple->payload[0];
@@ -363,13 +424,21 @@ int cloud_uplink_find_slot_by_mac(const cloud_uplink_t *uplink, const uint8_t ta
     if (!uplink || !target_mac) {
         return -1;
     }
+    int slot = -1;
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+    portENTER_CRITICAL((portMUX_TYPE *)&uplink->mux);
+#endif
     for (uint32_t i = 0; i < MAX_NODES_SUPPORTED; i++) {
         if (uplink->lifecycle.nodes[i].state != NODE_MQTT_STATE_IDLE &&
             memcmp(uplink->lifecycle.nodes[i].mac, target_mac, 6) == 0) {
-            return (int)i;
+            slot = (int)i;
+            break;
         }
     }
-    return -1;
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+    portEXIT_CRITICAL((portMUX_TYPE *)&uplink->mux);
+#endif
+    return slot;
 }
 
 int cloud_uplink_handle_downlink_attributes(cloud_uplink_t *uplink,
@@ -402,7 +471,17 @@ int cloud_uplink_handle_downlink_attributes(cloud_uplink_t *uplink,
     }
 
     if (cmd_buf[0] == CMD_MODE_CFG && cmd_len >= 7) {
-        uplink->ecg_stream_enabled[slot_id] = (cmd_buf[6] != 0);
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+        portENTER_CRITICAL(&uplink->mux);
+#endif
+        if (strstr(json_payload, "\"showEcg\"") != NULL || strstr(json_payload, "\"ecgEnabled\"") != NULL) {
+            uplink->ecg_stream_enabled[slot_id] = (cmd_buf[6] != 0);
+        } else {
+            cmd_buf[6] = uplink->ecg_stream_enabled[slot_id] ? 1 : 0;
+        }
+#if defined(ESP_PLATFORM) && !defined(HOST_UNIT_TEST)
+        portEXIT_CRITICAL(&uplink->mux);
+#endif
     }
 
     int frame_len = uart_frame_pack(out_uart_frame, max_frame_len,
@@ -421,14 +500,26 @@ void cloud_uplink_on_mqtt_data(cloud_uplink_t *uplink,
     }
 
     char json_buf[512];
-    if (data_len >= sizeof(json_buf)) return;
+    if (data_len >= sizeof(json_buf)) {
+        ESP_LOGW(TAG, "⚠️ [DOWNLINK] Attributes payload too large (%u >= %u bytes), dropped",
+                 (unsigned)data_len, (unsigned)sizeof(json_buf));
+        return;
+    }
     memcpy(json_buf, data, data_len);
     json_buf[data_len] = '\0';
 
     uint8_t uart_frame[UART_MAX_FRAME_LEN];
     int frame_len = cloud_uplink_handle_downlink_attributes(uplink, json_buf, uart_frame, sizeof(uart_frame));
     if (frame_len > 0) {
-        uart_bridge_tx_raw(uart_frame, (size_t)frame_len);
+        int sent = uart_bridge_tx_raw(uart_frame, (size_t)frame_len);
+        if (sent > 0) {
+            ESP_LOGI(TAG, "📥 [DOWNLINK] Forwarded CMD 0x%02X to Slot %u (%d bytes)",
+                     uart_frame[4], uart_frame[1], sent);
+        } else {
+            ESP_LOGE(TAG, "❌ [DOWNLINK] Failed to transmit UART frame (err=%d)", sent);
+        }
+    } else {
+        ESP_LOGW(TAG, "⚠️ [DOWNLINK] Failed to process attributes (err=%d)", frame_len);
     }
 }
 
