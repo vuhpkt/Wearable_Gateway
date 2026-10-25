@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "ble_protocol_def.h"
 #include "downlink_synthesizer.h"
@@ -388,6 +389,32 @@ int downlink_synth_parse_json(const char *json_str, uint8_t *out_buf, uint8_t ma
         out_buf[1] = name_len;
         memcpy(&out_buf[2], name, name_len);
         *out_len = (uint8_t)(2 + name_len);
+        return 0;
+    }
+
+    /* 7. Time Synchronization: CMD_TIME_CFG (0xC8) - 7 bytes */
+    if (json_find_key(json_str, "syncTime") != NULL ||
+        json_find_key(json_str, "epochUtc") != NULL ||
+        json_find_key(json_str, "time") != NULL) {
+        if (max_out_len < 7) return -2;
+
+        int32_t epoch = 0;
+        int32_t tz = 420; // Default +420 min (UTC+7)
+        if (!json_read_int(json_str, "epochUtc", &epoch)) {
+            if (!json_read_int(json_str, "time", &epoch)) {
+                epoch = (int32_t)time(NULL);
+            }
+        }
+        json_read_int(json_str, "tzOffsetMin", &tz);
+
+        out_buf[0] = CMD_TIME_CFG;
+        out_buf[1] = (uint8_t)(epoch & 0xFF);
+        out_buf[2] = (uint8_t)((epoch >> 8) & 0xFF);
+        out_buf[3] = (uint8_t)((epoch >> 16) & 0xFF);
+        out_buf[4] = (uint8_t)((epoch >> 24) & 0xFF);
+        out_buf[5] = (uint8_t)(tz & 0xFF);
+        out_buf[6] = (uint8_t)((tz >> 8) & 0xFF);
+        *out_len = 7;
         return 0;
     }
 

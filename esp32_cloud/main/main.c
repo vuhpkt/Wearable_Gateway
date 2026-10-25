@@ -28,6 +28,7 @@
 #include "thingsboard_client.h"
 #include "cloud_uplink.h"
 #include "system_health.h"
+#include "ble_protocol_def.h"
 
 static const char *TAG = "gateway_root";
 
@@ -43,6 +44,27 @@ static void on_sntp_sync(struct timeval *tv) {
     int64_t now_utc_ms = (int64_t)tv->tv_sec * 1000LL + (int64_t)(tv->tv_usec / 1000);
     uint64_t esp_mono_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
     uart_bridge_post_sntp(now_utc_ms, esp_mono_ms);
+
+    /* Broadcast time sync to all connected wearable nodes */
+    cloud_uplink_t *uplink = cloud_uplink_get_default_instance();
+    if (uplink && tv->tv_sec >= 1704067200) {
+        time_t now_s = (time_t)tv->tv_sec;
+        uint8_t time_cmd[7];
+        time_cmd[0] = CMD_TIME_CFG;
+        time_cmd[1] = (uint8_t)(now_s & 0xFF);
+        time_cmd[2] = (uint8_t)((now_s >> 8) & 0xFF);
+        time_cmd[3] = (uint8_t)((now_s >> 16) & 0xFF);
+        time_cmd[4] = (uint8_t)((now_s >> 24) & 0xFF);
+        int16_t tz_offset_min = 420; /* Vietnam UTC+7 (+420 min) */
+        time_cmd[5] = (uint8_t)(tz_offset_min & 0xFF);
+        time_cmd[6] = (uint8_t)((tz_offset_min >> 8) & 0xFF);
+        for (uint8_t slot = 0; slot < MAX_NODES_SUPPORTED; slot++) {
+            if (uplink->lifecycle.nodes[slot].state != NODE_MQTT_STATE_IDLE) {
+                uart_bridge_tx_frame(slot, UART_PKT_TYPE_DOWNLINK, time_cmd, 7);
+                ESP_LOGI(TAG, "⏰ SNTP sync: auto pushed CMD_TIME_CFG to slot %u", slot);
+            }
+        }
+    }
 }
 
 /* Control Queue (Static Allocation) */
@@ -116,6 +138,25 @@ static void cloud_consumer_task(void *pvParameters) {
                 }
             }
             cloud_uplink_default_dispatch(&tuple);
+
+            /* Auto time sync: When a node connects (status == 1), push CMD_TIME_CFG if real-time is available */
+            if (tuple.stream_type == STREAM_TYPE_STATUS && tuple.payload_len > 0 && tuple.payload[0] == 1) {
+                time_t now_s = time(NULL);
+                if (now_s >= 1704067200) {
+                    uint8_t time_cmd[7];
+                    time_cmd[0] = CMD_TIME_CFG;
+                    time_cmd[1] = (uint8_t)(now_s & 0xFF);
+                    time_cmd[2] = (uint8_t)((now_s >> 8) & 0xFF);
+                    time_cmd[3] = (uint8_t)((now_s >> 16) & 0xFF);
+                    time_cmd[4] = (uint8_t)((now_s >> 24) & 0xFF);
+                    int16_t tz_offset_min = 420; /* Vietnam UTC+7 (+420 min) */
+                    time_cmd[5] = (uint8_t)(tz_offset_min & 0xFF);
+                    time_cmd[6] = (uint8_t)((tz_offset_min >> 8) & 0xFF);
+                    uart_bridge_tx_frame(tuple.node_id, UART_PKT_TYPE_DOWNLINK, time_cmd, 7);
+                    ESP_LOGI(TAG, "⏰ Node %u connected: auto dispatched CMD_TIME_CFG (epoch=%ld, tz=+420)",
+                             tuple.node_id, (long)now_s);
+                }
+            }
         }
     }
 }

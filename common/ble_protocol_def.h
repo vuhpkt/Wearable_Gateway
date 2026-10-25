@@ -56,5 +56,6 @@ typedef struct {
 #define CMD_VITAL_CFG                  0xCC    /* 3-5 bytes: [0xCC][int_lo][int_hi][lcd_lo][lcd_hi] */
 #define CMD_MODE_CFG                   0xCB    /* 7 bytes: mode, period, capture, ecgEnabled */
 #define CMD_NAME_CFG                   0xC9    /* 2-17 bytes: [0xC9][len][name...] */
+#define CMD_TIME_CFG                   0xC8    /* 7 bytes: [0xC8][epochUtc u32 LE][tzOffsetMin i16 LE] */
 
 #endif /* BLE_PROTOCOL_DEF_H */
