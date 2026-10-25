@@ -127,6 +127,9 @@ static void cloud_consumer_task(void *pvParameters) {
     }
 
     static frame_snapshot_tuple_t tuple;
+    static int64_t s_last_time_sync_mono[MAX_NODES_SUPPORTED] = {0};
+    static bool    s_node_time_synced[MAX_NODES_SUPPORTED] = {0};
+
     while (1) {
         cloud_uplink_default_process_events();
 
@@ -140,22 +143,43 @@ static void cloud_consumer_task(void *pvParameters) {
             }
             cloud_uplink_default_dispatch(&tuple);
 
-            /* Auto time sync: When a node connects (status == 1), push CMD_TIME_CFG if real-time is available */
-            if (tuple.stream_type == STREAM_TYPE_STATUS && tuple.payload_len > 0 && tuple.payload[0] == 1) {
-                time_t now_s = time(NULL);
-                if (now_s >= 1704067200) {
-                    uint8_t time_cmd[7];
-                    time_cmd[0] = CMD_TIME_CFG;
-                    time_cmd[1] = (uint8_t)(now_s & 0xFF);
-                    time_cmd[2] = (uint8_t)((now_s >> 8) & 0xFF);
-                    time_cmd[3] = (uint8_t)((now_s >> 16) & 0xFF);
-                    time_cmd[4] = (uint8_t)((now_s >> 24) & 0xFF);
-                    int16_t tz_offset_min = 420; /* Vietnam UTC+7 (+420 min) */
-                    time_cmd[5] = (uint8_t)(tz_offset_min & 0xFF);
-                    time_cmd[6] = (uint8_t)((tz_offset_min >> 8) & 0xFF);
-                    uart_bridge_tx_frame(tuple.node_id, UART_PKT_TYPE_DOWNLINK, time_cmd, 7);
-                    ESP_LOGI(TAG, "⏰ Node %u connected: auto dispatched CMD_TIME_CFG (epoch=%ld, tz=+420)",
-                             tuple.node_id, (long)now_s);
+            /* Track node disconnection to reset sync state */
+            if (tuple.stream_type == STREAM_TYPE_STATUS && tuple.payload_len > 0 && tuple.payload[0] == 0) {
+                if (tuple.node_id < MAX_NODES_SUPPORTED) {
+                    s_node_time_synced[tuple.node_id] = false;
+                    s_last_time_sync_mono[tuple.node_id] = 0;
+                }
+            }
+
+            /* Auto time sync: When telemetry (VITALS or ECG) arrives from a node,
+             * GATT discovery on nRF Central has 100% completed and rx_char_val_handle (0x1402)
+             * is guaranteed valid. We dispatch CMD_TIME_CFG on the very first telemetry frame,
+             * and re-sync periodically every 3600 seconds (1 hour) to compensate for LFCLK drift. */
+            if (tuple.stream_type == STREAM_TYPE_VITALS || tuple.stream_type == STREAM_TYPE_ECG) {
+                if (tuple.node_id < MAX_NODES_SUPPORTED) {
+                    int64_t now_mono_ms = (int64_t)(esp_timer_get_time() / 1000ULL);
+                    bool need_sync = !s_node_time_synced[tuple.node_id] ||
+                                     (now_mono_ms - s_last_time_sync_mono[tuple.node_id] >= 3600000LL);
+
+                    if (need_sync) {
+                        time_t now_s = time(NULL);
+                        if (now_s >= 1704067200) { /* Real UTC time synced via SNTP (>= 2024-01-01) */
+                            uint8_t time_cmd[7];
+                            time_cmd[0] = CMD_TIME_CFG;
+                            time_cmd[1] = (uint8_t)(now_s & 0xFF);
+                            time_cmd[2] = (uint8_t)((now_s >> 8) & 0xFF);
+                            time_cmd[3] = (uint8_t)((now_s >> 16) & 0xFF);
+                            time_cmd[4] = (uint8_t)((now_s >> 24) & 0xFF);
+                            int16_t tz_offset_min = 420; /* Vietnam UTC+7 (+420 min) */
+                            time_cmd[5] = (uint8_t)(tz_offset_min & 0xFF);
+                            time_cmd[6] = (uint8_t)((tz_offset_min >> 8) & 0xFF);
+                            uart_bridge_tx_frame(tuple.node_id, UART_PKT_TYPE_DOWNLINK, time_cmd, 7);
+                            s_node_time_synced[tuple.node_id] = true;
+                            s_last_time_sync_mono[tuple.node_id] = now_mono_ms;
+                            ESP_LOGI(TAG, "⏰ Node %u: auto dispatched CMD_TIME_CFG on active telemetry (epoch=%ld, tz=+420)",
+                                     tuple.node_id, (long)now_s);
+                        }
+                    }
                 }
             }
         }
