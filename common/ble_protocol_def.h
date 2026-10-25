@@ -26,15 +26,16 @@
 #define ECG_DEFAULT_SAMPLES_PER_PKT    50U     /* 50 samples = 200 ms batch */
 #define ECG_DEFAULT_PAYLOAD_LEN        (ECG_DEFAULT_SAMPLES_PER_PKT * sizeof(int16_t)) /* 100 bytes */
 
-#define VITALS_PAYLOAD_LEN             5U      /* Exactly 5 bytes */
+#define VITALS_PAYLOAD_LEN             6U      /* Exactly 6 bytes */
 
 /* ══════════════════════════════════════════════════════════════
- *  Vitals Payload Layout (5 Bytes)
+ *  Vitals Payload Layout (6 Bytes)
  *  Byte 0: ECG Heart Rate (uint8_t, bpm)
  *  Byte 1: PPG Heart Rate (uint8_t, bpm)
  *  Byte 2: SpO2 (uint8_t, %)
  *  Byte 3: Temperature Low Byte  (uint16_t LE, temp x 10)
  *  Byte 4: Temperature High Byte
+ *  Byte 5: Battery Percentage    (uint8_t, %, 0xFF if invalid)
  * ════════════════════════════════════════════════════════════ */
 #pragma pack(push, 1)
 typedef struct {
@@ -42,6 +43,7 @@ typedef struct {
     uint8_t  hr_ppg;
     uint8_t  spo2;
     uint16_t temp_x10;  /* temp_celsius = temp_x10 / 10.0f */
+    uint8_t  battery;   /* battery percent 0..100%, 0xFF if invalid */
 } vitals_packet_t;
 #pragma pack(pop)
 

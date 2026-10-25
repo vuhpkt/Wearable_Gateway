@@ -328,10 +328,17 @@ void cloud_uplink_process_telemetry(cloud_uplink_t *uplink, const frame_snapshot
             const vitals_packet_t *v = (const vitals_packet_t *)tuple->payload;
             float temp_c = (float)v->temp_x10 / 10.0f;
             (void)temp_c;
-            ESP_LOGI(TAG, "💓 [NODE %u VITALS] HR_ECG: %u bpm | HR_PPG: %u bpm | SpO2: %u%% | Temp: %.1f°C | MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-                     tuple->node_id, v->hr_ecg, v->hr_ppg, v->spo2, temp_c,
-                     tuple->mac[0], tuple->mac[1], tuple->mac[2],
-                     tuple->mac[3], tuple->mac[4], tuple->mac[5]);
+            if (v->battery <= 100) {
+                ESP_LOGI(TAG, "💓 [NODE %u VITALS] HR_ECG: %u bpm | HR_PPG: %u bpm | SpO2: %u%% | Temp: %.1f°C | Bat: %u%% | MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                         tuple->node_id, v->hr_ecg, v->hr_ppg, v->spo2, temp_c, v->battery,
+                         tuple->mac[0], tuple->mac[1], tuple->mac[2],
+                         tuple->mac[3], tuple->mac[4], tuple->mac[5]);
+            } else {
+                ESP_LOGI(TAG, "💓 [NODE %u VITALS] HR_ECG: %u bpm | HR_PPG: %u bpm | SpO2: %u%% | Temp: %.1f°C | Bat: N/A | MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                         tuple->node_id, v->hr_ecg, v->hr_ppg, v->spo2, temp_c,
+                         tuple->mac[0], tuple->mac[1], tuple->mac[2],
+                         tuple->mac[3], tuple->mac[4], tuple->mac[5]);
+            }
 
             int len = synth_format_mac_vitals(uplink->tx_buffer, sizeof(uplink->tx_buffer), tuple, v, "gw-01");
             if (len > 0 && tb_mqtt_is_connected()) {

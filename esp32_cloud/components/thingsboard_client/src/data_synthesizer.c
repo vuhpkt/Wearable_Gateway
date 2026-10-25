@@ -174,6 +174,7 @@ int synth_format_mac_vitals(char *dest, size_t max_len,
     if (v->hr_ecg > 0)   v_len += snprintf(values + v_len, sizeof(values) - v_len, "%s\"ecgHeartRate\":%u", (v_len > 0) ? "," : "", v->hr_ecg);
     if (v->hr_ppg > 0)   v_len += snprintf(values + v_len, sizeof(values) - v_len, "%s\"ppgHeartRate\":%u", (v_len > 0) ? "," : "", v->hr_ppg);
     if (temp_c > 0.0f)   v_len += snprintf(values + v_len, sizeof(values) - v_len, "%s\"temperature\":%.1f", (v_len > 0) ? "," : "", temp_c);
+    if (v->battery > 0 && v->battery <= 100) v_len += snprintf(values + v_len, sizeof(values) - v_len, "%s\"battery\":%u", (v_len > 0) ? "," : "", v->battery);
 
     if (v_len == 0) {
         return 0; /* No valid vitals to publish */
@@ -288,6 +289,7 @@ int synth_format_vitals(char *dest, size_t max_len, uint8_t node_id,
     if (v->hr_ppg > 0) v_len += snprintf(values + v_len, sizeof(values) - v_len, "%s\"ppgHeartRate\":%u", (v_len > 0) ? "," : "", v->hr_ppg);
     if (v->spo2 > 0)   v_len += snprintf(values + v_len, sizeof(values) - v_len, "%s\"spo2\":%u",         (v_len > 0) ? "," : "", v->spo2);
     if (temp_c > 0.0f) v_len += snprintf(values + v_len, sizeof(values) - v_len, "%s\"temperature\":%.1f", (v_len > 0) ? "," : "", temp_c);
+    if (v->battery > 0 && v->battery <= 100) v_len += snprintf(values + v_len, sizeof(values) - v_len, "%s\"battery\":%u", (v_len > 0) ? "," : "", v->battery);
 
     if (v_len == 0) return 0;
 
