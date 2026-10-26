@@ -1,0 +1,55 @@
+{
+  "version": "2.0.0",
+  "name": "End-to-End Fault Injection Matrix & Canary Scenarios",
+  "generated_at": "2026-10-19T20:30:00Z",
+  "invariants": {
+    "zero_identity_mix": true,
+    "zero_heap_allocation": true,
+    "freshness_window_ms": 5000,
+    "max_nodes": 10
+  },
+  "scenarios": [
+    {
+      "id": "F01_LOST_DISCONNECT",
+      "description": "BLE disconnect status lost over UART; subsequent frames rejected by session ID check",
+      "expected_outcome": "REJECTED_BY_SESSION_ID",
+      "identity_mixed": false
+    },
+    {
+      "id": "F02_SLOT_REUSE_RACE",
+      "description": "Slot 1 assigned to Watch B while late callback from Watch A arrives",
+      "expected_outcome": "REJECTED_BY_MAC_MISMATCH",
+      "identity_mixed": false
+    },
+    {
+      "id": "F03_SPLIT_AND_CRC_CORRUPT",
+      "description": "Byte splitting and 1-bit flip CRC corruption on wire",
+      "expected_outcome": "DROPPED_AT_CORE1_PARSER",
+      "identity_mixed": false
+    },
+    {
+      "id": "F04_QUEUE_SATURATION",
+      "description": "Burst of 100 frames into 64-item ring buffer under backpressure",
+      "expected_outcome": "SAFE_DROP_OLDEST_ZERO_OVERFLOW",
+      "identity_mixed": false
+    },
+    {
+      "id": "F05_SNTP_UNSYNCED_BOOT",
+      "description": "Telemetry ingested before Gateway acquires SNTP lock",
+      "expected_outcome": "TIME_QUAL_UNSYNCED_PROMOTED_TO_UNKNOWN",
+      "identity_mixed": false
+    },
+    {
+      "id": "F06_PATIENT_BOUNDARY_CLIPPING",
+      "description": "Watch reassigned at 5000ms; ECG batch [4900ms, 5100ms] strictly clipped",
+      "expected_outcome": "SAMPLES_CLIPPED_EXACTLY_AT_5000MS",
+      "identity_mixed": false
+    },
+    {
+      "id": "F07_GATEWAY_POWER_OFF_FRESHNESS",
+      "description": "Gateway powered off; telemetry evaluated at 4999ms, 5000ms, 5001ms",
+      "expected_outcome": "4999MS_LIVE_5000MS_STALE_5001MS_STALE",
+      "identity_mixed": false
+    }
+  ]
+}

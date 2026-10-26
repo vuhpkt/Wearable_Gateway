@@ -1,0 +1,24 @@
+name: Gateway Host Unit Tests CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up GCC & Build Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc make bash
+
+      - name: Run Host Unit Tests (28 Test Suites)
+        run: |
+          chmod +x tools/run_tests.sh
+          bash tools/run_tests.sh

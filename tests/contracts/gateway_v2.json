@@ -1,0 +1,157 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GatewayV2Contracts",
+  "description": "Golden contract vectors and schema constraints for Wearable Gateway v2 (UART, MQTT, Identity)",
+  "constants": {
+    "UART_BRIDGE_BAUDRATE": 460800,
+    "UART_FRAME_SOF": 170,
+    "UART_MAX_PAYLOAD_LEN": 128,
+    "UART_FRAME_HEADER_LEN": 4,
+    "UART_FRAME_OVERHEAD": 5,
+    "MAX_NODES_SUPPORTED": 10,
+    "FRESHNESS_WINDOW_MS": 5000,
+    "CRC8_POLYNOMIAL": 7
+  },
+  "packet_types": {
+    "UART_PKT_TYPE_ECG_BATCH": 1,
+    "UART_PKT_TYPE_VITALS": 2,
+    "UART_PKT_TYPE_NODE_STATUS": 3,
+    "UART_PKT_TYPE_ECG_V2": 17,
+    "UART_PKT_TYPE_VITALS_V2": 18,
+    "UART_PKT_TYPE_NODE_STATUS_V2": 19,
+    "UART_PKT_TYPE_CONTROL_HELLO": 32,
+    "UART_PKT_TYPE_CONTROL_SYNC": 33,
+    "UART_PKT_TYPE_SNAPSHOT_REQ": 34,
+    "UART_PKT_TYPE_SNAPSHOT_END": 35,
+    "UART_PKT_TYPE_DOWNLINK": 128,
+    "UART_PKT_TYPE_DOWNLINK_V2": 144
+  },
+  "golden_vectors": {
+    "node_status_7b_connect": {
+      "node_id": 0,
+      "pkt_type": 3,
+      "payload_len": 7,
+      "status": 1,
+      "mac_bytes": [228, 95, 1, 35, 69, 103],
+      "mac_canonical": "E4:5F:01:23:45:67",
+      "expected_crc8": 34,
+      "wire_frame_hex": "AA00030701E45F0123456722"
+    },
+    "node_status_7b_disconnect": {
+      "node_id": 0,
+      "pkt_type": 3,
+      "payload_len": 7,
+      "status": 0,
+      "mac_bytes": [228, 95, 1, 35, 69, 103],
+      "mac_canonical": "E4:5F:01:23:45:67",
+      "expected_crc8": 253,
+      "wire_frame_hex": "AA00030700E45F01234567FD"
+    },
+    "control_hello": {
+      "node_id": 0,
+      "pkt_type": 32,
+      "payload_len": 8,
+      "version": 2,
+      "boot_nonce": 305419896,
+      "expected_crc8": 108,
+      "wire_frame_hex": "AA00200802007856341200006C"
+    },
+    "control_sync": {
+      "node_id": 0,
+      "pkt_type": 33,
+      "payload_len": 16,
+      "version": 2,
+      "boot_nonce": 305419896,
+      "expected_crc8": 109,
+      "wire_frame_hex": "AA002110020078563412080706050403020101006D"
+    },
+    "snapshot_req": {
+      "node_id": 0,
+      "pkt_type": 34,
+      "payload_len": 12,
+      "transaction_id": 1,
+      "expected_crc8": 129,
+      "wire_frame_hex": "AA00220C08070605040302010100000081"
+    },
+    "snapshot_end": {
+      "node_id": 0,
+      "pkt_type": 35,
+      "payload_len": 14,
+      "transaction_id": 1,
+      "slot_count": 10,
+      "expected_crc8": 78,
+      "wire_frame_hex": "AA00230E0807060504030201010000000A004E"
+    },
+    "mqtt_gateway_connect": {
+      "topic": "v1/gateway/connect",
+      "expected_payload": {
+        "device": "E4:5F:01:23:45:67",
+        "type": "Wearable"
+      }
+    },
+    "mqtt_gateway_disconnect": {
+      "topic": "v1/gateway/disconnect",
+      "expected_payload": {
+        "device": "E4:5F:01:23:45:67"
+      }
+    },
+    "mqtt_gateway_attributes": {
+      "topic": "v1/gateway/attributes",
+      "expected_payload": {
+        "E4:5F:01:23:45:67": {
+          "macAddress": "E4:5F:01:23:45:67",
+          "bleConnected": true,
+          "gatewayId": "gw-01",
+          "bridgeEpoch": "00000000000003E8",
+          "sessionId": 42,
+          "statusSeq": 17,
+          "statusTs": 1792380000000
+        }
+      }
+    },
+    "mqtt_gateway_telemetry_vitals": {
+      "topic": "v1/gateway/telemetry",
+      "expected_payload": {
+        "E4:5F:01:23:45:67": [
+          {
+            "ts": 1792380000123,
+            "values": {
+              "spo2": 98,
+              "ecgHeartRate": 72,
+              "ppgHeartRate": 70,
+              "temperature": 36.5,
+              "gatewayId": "gw-01",
+              "bridgeEpoch": "00000000000003E8",
+              "sessionId": 42,
+              "seq": 18,
+              "timeQuality": "SYNCED",
+              "timeBasis": "CENTRAL_RX"
+            }
+          }
+        ]
+      }
+    },
+    "mqtt_gateway_telemetry_ecg": {
+      "topic": "v1/gateway/telemetry",
+      "expected_payload": {
+        "E4:5F:01:23:45:67": [
+          {
+            "ts": 1792380000123,
+            "values": {
+              "ecg_batch": "[500,510,520]",
+              "samplePeriodMs": 4,
+              "sampleCount": 3,
+              "batchEndTs": 1792380000123,
+              "gatewayId": "gw-01",
+              "bridgeEpoch": "00000000000003E8",
+              "sessionId": 42,
+              "seq": 19,
+              "timeQuality": "SYNCED",
+              "timeBasis": "CENTRAL_RX"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

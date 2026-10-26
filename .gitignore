@@ -1,15 +1,38 @@
-# Zephyr & West build directories
+# Build directories
 build/
+_build/
 *.uf2
 *.hex
 *.bin
 *.elf
 *.map
+*.o
+*.a
+*.exe
+
+# ESP-IDF
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# Zephyr & West
+.west/
+
+# Editor & OS artifacts
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.txt
+!CMakeLists.txt
+!requirements.txt
 
 # Python cache
 __pycache__/
 *.py[cod]
-
-# ESP-IDF generated config
-sdkconfig
-sdkconfig.old
+*$py.class
+.venv/
+venv/
